@@ -72,7 +72,7 @@ class StrategyEngine:
                 entry = candle["close"]
                 sl = candle["low"] - candle["atr_14"] * 2.0
                 bp = entry - sl
-                tp = entry + bp * 1.5
+                tp = entry + bp * 2.0
                 return {
                     "type": "long", "entry": entry, "sl": sl, "tp": tp, "strategy_id": 1,
                     "strategy_name": "EMA Trend Pullback",
@@ -86,7 +86,7 @@ class StrategyEngine:
                 entry = candle["close"]
                 sl = candle["high"] + candle["atr_14"] * 2.0
                 bp = sl - entry
-                tp = entry - bp * 1.5
+                tp = entry - bp * 2.0
                 return {
                     "type": "short", "entry": entry, "sl": sl, "tp": tp, "strategy_id": 1,
                     "strategy_name": "EMA Trend Pullback",
@@ -111,7 +111,7 @@ class StrategyEngine:
                 entry = candle["close"]
                 sl = candle["low"] - candle["atr_14"] * 2.0
                 bp = entry - sl
-                tp = entry + bp * 1.5
+                tp = entry + bp * 2.0
                 return {
                     "type": "long", "entry": entry, "sl": sl, "tp": tp, "strategy_id": 2,
                     "strategy_name": "Volatility Breakout",
@@ -125,7 +125,7 @@ class StrategyEngine:
                 entry = candle["close"]
                 sl = candle["high"] + candle["atr_14"] * 2.0
                 bp = sl - entry
-                tp = entry - bp * 1.5
+                tp = entry - bp * 2.0
                 return {
                     "type": "short", "entry": entry, "sl": sl, "tp": tp, "strategy_id": 2,
                     "strategy_name": "Volatility Breakout",
@@ -145,7 +145,7 @@ class StrategyEngine:
             if candle["low"] <= candle["bb_lower"] and candle["close"] > candle["bb_lower"]:
                 entry = candle["close"]
                 sl = candle["low"] - candle["atr_14"] * 2.0
-                tp = entry + (entry - sl) * 1.5
+                tp = entry + (entry - sl) * 2.0
                 return {
                     "type": "long", "entry": entry, "sl": sl, "tp": tp, "strategy_id": 3,
                     "strategy_name": "Mean Reversion (Range)",
@@ -157,7 +157,7 @@ class StrategyEngine:
             if candle["high"] >= candle["bb_upper"] and candle["close"] < candle["bb_upper"]:
                 entry = candle["close"]
                 sl = candle["high"] + candle["atr_14"] * 2.0
-                tp = entry - (sl - entry) * 1.5
+                tp = entry - (sl - entry) * 2.0
                 return {
                     "type": "short", "entry": entry, "sl": sl, "tp": tp, "strategy_id": 3,
                     "strategy_name": "Mean Reversion (Range)",
@@ -208,7 +208,7 @@ class StrategyEngine:
                 entry = candle["close"]
                 if candle["close"] > candle["open"]:
                     sl = candle["low"] - candle["atr_14"] * 2.0
-                    tp = entry + (entry - sl) * 1.5
+                    tp = entry + (entry - sl) * 2.0
                     return {
                         "type": "long", "entry": entry, "sl": sl, "tp": tp, "strategy_id": 5,
                         "strategy_name": "High-Volume Anomaly",
@@ -218,7 +218,7 @@ class StrategyEngine:
                     }
                 else:
                     sl = candle["high"] + candle["atr_14"] * 2.0
-                    tp = entry - (sl - entry) * 1.5
+                    tp = entry - (sl - entry) * 2.0
                     return {
                         "type": "short", "entry": entry, "sl": sl, "tp": tp, "strategy_id": 5,
                         "strategy_name": "High-Volume Anomaly",
@@ -239,8 +239,8 @@ class StrategyEngine:
         if bullish_trend:
             if candle["low"] < ema_9 and candle["close"] > ema_9:
                 entry = candle["close"]
-                sl = candle["low"] - candle["atr_14"] * 1.5
-                tp = entry + (entry - sl) * 1.5
+                sl = candle["low"] - candle["atr_14"] * 2.0
+                tp = entry + (entry - sl) * 2.0
                 return {
                     "type": "long", "entry": entry, "sl": sl, "tp": tp, "strategy_id": 6,
                     "strategy_name": "HFT Scalper (M1/M5)",
@@ -251,8 +251,8 @@ class StrategyEngine:
         elif bearish_trend:
             if candle["high"] > ema_9 and candle["close"] < ema_9:
                 entry = candle["close"]
-                sl = candle["high"] + candle["atr_14"] * 1.5
-                tp = entry - (sl - entry) * 1.5
+                sl = candle["high"] + candle["atr_14"] * 2.0
+                tp = entry - (sl - entry) * 2.0
                 return {
                     "type": "short", "entry": entry, "sl": sl, "tp": tp, "strategy_id": 6,
                     "strategy_name": "HFT Scalper (M1/M5)",

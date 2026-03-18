@@ -14,11 +14,23 @@ class BacktestEngine:
         self.equity_curve = []
         
     def run(self):
-        # We start looking for signals after 200 candles to give indicators time to settle, 
-        # though we already dropped NaN in indicator engine, we can just start at index 1
+        last_date = None
+        
         for i in range(1, len(self.data) - 1):
-            current_slice = self.data.iloc[:i+1]
+            current_row = self.data.iloc[i]
+            current_date = current_row["timestamp"].date()
             
+            # Daily Reset
+            if last_date is None or current_date > last_date:
+                self.risk_engine.reset_daily_pnl()
+                last_date = current_date
+            
+            # Daily Limit Check
+            if not self.risk_engine.is_trading_allowed(self.balance):
+                self.equity_curve.append(self.balance)
+                continue
+
+            current_slice = self.data.iloc[:i+1]
             signal = self.strategy.check_strategy(current_slice, self.num_strategies)
             
             if signal:
@@ -26,6 +38,7 @@ class BacktestEngine:
                 if result:
                     self.trades.append(result)
                     self.balance += result["profit"]
+                    self.risk_engine.update_daily_pnl(result["profit"])
             
             self.equity_curve.append(self.balance)
             

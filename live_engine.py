@@ -8,9 +8,16 @@ from strategy_engine import StrategyEngine
 from risk_engine import RiskEngine
 
 class LiveDemoEngine:
-    def __init__(self, initial_balance=10000, risk_per_trade=0.01, num_strategies=5, use_mt5=False, symbol="XAUUSD"):
+    def __init__(self, initial_balance=5000, risk_per_trade=0.005, num_strategies=5, use_mt5=False, symbol="XAUUSD"):
         self.strategy_engine = StrategyEngine()
-        self.risk_engine = RiskEngine(risk_percent=risk_per_trade)
+        self.risk_engine = RiskEngine(
+            risk_percent=risk_per_trade, 
+            fixed_risk_usd=25.0, 
+            daily_loss_limit=200.0, # 4% as per GFT
+            max_overall_loss=500.0, # 10% as per GFT
+            initial_balance=initial_balance,
+            target_profit=400.0 # 8% Target for Phase 1
+        )
         self.balance = initial_balance
         self.active_trade = None
         self.history = []
@@ -32,6 +39,10 @@ class LiveDemoEngine:
             history_df = pd.DataFrame([new_candle_row])
             
         print(f"[{time.strftime('%H:%M:%S')}] Received new candle. Total rolling history: {len(history_df)} bars.")
+        
+        # 1. RISK CHECK (Prop Firm Rules)
+        if not self.risk_engine.is_trading_allowed(self.balance):
+            return history_df
         
         # We need a decent chunk of history to compute 200 EMA and structure comfortably
         if len(history_df) < 250: # Adjusted from 250 to 200 for current_slice, but 250 is safer for full indicators
@@ -127,7 +138,8 @@ class LiveDemoEngine:
             "entry_atr": current_candle.get("atr_14", 0),
             "candle_count": 0,
             "be_moved": False,
-            "partial_tp_hit": False
+            "partial_tp_hit": False,
+            "open_time": time.time() # For 2-minute safety buffer
         }
         
         print(f"[{time.strftime('%H:%M:%S')}] TRADE ACTIVE | SL: {sl:.2f} | TP: {tp:.2f} | Ticket: {ticket}")
@@ -248,13 +260,23 @@ class LiveDemoEngine:
             position = mt5.positions_get(ticket=t["mt5_ticket"])
             if not position:
                 print(f"[{time.strftime('%H:%M:%S')}] MT5 Position {t['mt5_ticket']} closed externally (SL/TP).")
-                self.active_trade = None
+                # Even if closed externally, we need to handle the removal
+                self._handle_trade_closure(reason="External Close (MT5)")
                 return
             
             # Update current price from MT5 if possible for more accuracy
             symbol_tick = mt5.symbol_info_tick(self.symbol)
             if symbol_tick:
                 current_price = symbol_tick.bid if t["type"] == "long" else symbol_tick.ask
+
+        # 2.5 SAFETY BUFFER (2-Minute Rule)
+        elapsed_seconds = time.time() - t["open_time"]
+        if elapsed_seconds < 120:
+            # We skip all exit checks if trade is < 2 mins old
+            # Note: This technically includes SL/TP hits in simulation, 
+            # but on MT5 the server will execute them regardless. 
+            # We mainly prevent the SCRIPT from closing it prematurely.
+            return
 
         # 3. PARTIAL TAKE-PROFIT & BREAK-EVEN & TRAILING STOP LOGIC
         if t["type"] == "long":
@@ -458,6 +480,9 @@ class LiveDemoEngine:
         if abs(final_pnl) <= 0.01: status = "BREAK-EVEN ⚖️"
         elif t.get("be_moved") and final_pnl > -0.01: status = "BREAK-EVEN ⚖️"
         
+        # Update Daily Tracker
+        self.risk_engine.update_daily_pnl(final_pnl)
+        
         # Log Detailed Outcome
         print("\n" + "="*50)
         print(f"🏁 TRADE CLOSED: {t.get('strategy_name', 'Strat ' + str(t.get('strategy', '?')))}")
@@ -467,7 +492,20 @@ class LiveDemoEngine:
         print("-"*50)
         
         self.balance += final_pnl
-        print(f"New Balance: ${self.balance:.2f}")
+        print(f"New Balance: ${self.balance:.2f} | Today: ${self.risk_engine.daily_loss_accumulator:+.2f}")
         print("="*50 + "\n")
 
+        self.active_trade = None
+
+    def _handle_trade_closure(self, reason=""):
+        """Special handler for trades closed outside the script (e.g. SL hit on server)"""
+        t = self.active_trade
+        if not t: return
+        
+        if self.use_mt5 and t.get("mt5_ticket"):
+            final_pnl = self._get_mt5_pnl(t["mt5_ticket"])
+            self.risk_engine.update_daily_pnl(final_pnl)
+            self.balance += final_pnl
+            print(f"[{time.strftime('%H:%M:%S')}] External Trade Closed. PnL: ${final_pnl:.2f} | Reason: {reason}")
+            
         self.active_trade = None
