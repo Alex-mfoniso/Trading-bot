@@ -18,6 +18,27 @@ An institutional-grade algorithmic trading system for **Gold (XAUUSD)**, built w
 
 ---
 
+## 🔗 MetaTrader 5 Connection & Setup
+
+Follow these steps to connect the bot to your MT5 terminal:
+
+### 1. Terminal Configuration
+1.  Open your **MetaTrader 5** terminal.
+2.  Go to **Tools > Options** (or press `Ctrl+O`).
+3.  In the **Expert Advisors** tab:
+    *   ✅ Check **"Allow Algo Trading"**.
+    *   ✅ Check **"Allow DLL imports"**.
+4.  Ensure you are logged into your **Demo or Live account**.
+5.  In the **Market Watch**, ensure `XAUUSD` (or your broker's symbol for Gold, e.g., `GOLD`) is visible.
+
+### 2. Python Environment
+Ensure you have the MT5 Python library installed:
+```bash
+pip install MetaTrader5 pandas numpy
+```
+
+---
+
 ## 🛠 Project Structure
 
 - `main.py`: Main entry point for the application.
@@ -42,34 +63,35 @@ An institutional-grade algorithmic trading system for **Gold (XAUUSD)**, built w
 
 ---
 
-## 📦 Navigation & Setup
+## 📦 How to Use the Bot
 
-### 1. Requirements
-*   **Python 3.10+**
-*   **MetaTrader 5 Terminal** (running on Windows)
-*   Required libs: `pandas`, `numpy`, `MetaTrader5`
-
-### 2. Configure Your Settings
+### 1. Configure Your Settings
 Update the constants in `main.py` or `run_backtest.py`:
-- `SYMBOL = "XAUUSD"`
-- `RISK_PER_TRADE = 0.01` (1%)
-- `SPREAD = 0.20` (Adjust based on your broker's gold spread)
+- `SYMBOL = "XAUUSD"` (Check if your broker uses `GOLD` instead).
+- `RISK_PER_TRADE = 0.01` (Default is 1%).
+- `SPREAD = 0.20` (Adjust based on your broker's specific gold spread).
 
-### 3. Running a Backtest
+### 2. Running a Backtest
+Validate your strategy on historical bars:
 ```powershell
 python run_backtest.py
 ```
 This will prompt you for:
-- Number of bars to test
-- Timeframe (M5, M15, H1, etc.)
-- Number of strategies to evaluate (1-5)
-- Spread adjustment for simulation accuracy
+- **Bars to test**: e.g., 5000 for a long history.
+- **Timeframe**: M5, M15, H1, etc.
+- **Strategies**: 1 to 5 depending on your focus.
+- **Spread**: Realistic dollar cost per trade.
 
-### 4. Running Live/Demo
+### 3. Running Live/Demo Execution
+Connect the bot to your MT5 terminal for real-time trading:
 ```powershell
 python run_mt5_demo.py
 ```
-*Make sure MT5 allows "Algo Trading" in the terminal settings!*
+The bot will:
+1.  Initialize connection to your running MT5 terminal.
+2.  Wait for new candles on the `XAUUSD` chart.
+3.  Execute trades based on the selected strategies.
+4.  Manage **Partial Take-Profits**, **Break-Even moves**, and **Trailing Stops** automatically.
 
 ---
 
