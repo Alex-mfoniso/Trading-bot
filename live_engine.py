@@ -1,5 +1,7 @@
 import pandas as pd
 import time
+import os
+import csv
 import MetaTrader5 as mt5
 from indicator_engine import IndicatorEngine
 from structure_engine import StructureEngine
@@ -13,7 +15,7 @@ class LiveDemoEngine:
         self.risk_engine = RiskEngine(
             risk_percent=risk_per_trade, 
             fixed_risk_usd=25.0, 
-            daily_loss_limit=200.0, # 4% as per GFT
+            daily_loss_limit=150.0, # $150 as per Goat Funded Trader rules
             max_overall_loss=500.0, # 10% as per GFT
             initial_balance=initial_balance,
             target_profit=400.0 # 8% Target for Phase 1
@@ -24,6 +26,9 @@ class LiveDemoEngine:
         self.num_strategies = num_strategies
         self.use_mt5 = use_mt5
         self.symbol = symbol
+        self.htf_trend = 0 # 1: Bullish, -1: Bearish, 0: Unknown/Neutral
+        self.log_file = "trade_history.csv"
+        self._initialize_log()
         
         mode = "MT5 REAL-TIME" if use_mt5 else "LOCAL SIMULATION"
         print(f"[{time.strftime('%H:%M:%S')}] LIVE DEMO INITIALIZED | Mode: {mode} | Balance: {self.balance} | Risk: {risk_per_trade*100}% | Strategies: {num_strategies}")
@@ -41,7 +46,9 @@ class LiveDemoEngine:
         print(f"[{time.strftime('%H:%M:%S')}] Received new candle. Total rolling history: {len(history_df)} bars.")
         
         # 1. RISK CHECK (Prop Firm Rules)
-        if not self.risk_engine.is_trading_allowed(self.balance):
+        allowed, reason = self.risk_engine.is_trading_allowed(self.balance)
+        if not allowed:
+            print(f"[{time.strftime('%H:%M:%S')}] 🛑 [ABORTED] {reason}")
             return history_df
         
         # We need a decent chunk of history to compute 200 EMA and structure comfortably
@@ -58,8 +65,15 @@ class LiveDemoEngine:
         current_slice = window.tail(200) # Use a smaller, processed slice for strategy checks
         current_candle = current_slice.iloc[-1]
 
+        # 1.5 MTF TREND CHECK (Fetching H1 trend from MT5 if enabled)
+        if self.use_mt5:
+            self.htf_trend = self._fetch_htf_trend()
+            if self.htf_trend != 0:
+                trend_str = "BULLISH 🟢" if self.htf_trend == 1 else "BEARISH 🔴"
+                print(f"[{time.strftime('%H:%M:%S')}] HTF TREND (H1): {trend_str}")
+        
         # 2. Check for new signals ALWAYS (even if trade is active, for opposite signals)
-        signal = self.strategy_engine.check_strategy(current_slice, self.num_strategies)
+        signal = self.strategy_engine.check_strategy(current_slice, self.num_strategies, htf_trend=self.htf_trend)
         
         # 3. If trade is active, manage it
         if self.active_trade:
@@ -68,14 +82,29 @@ class LiveDemoEngine:
             # CHECK FOR OPPOSITE SIGNAL EXIT (Sensible check)
             if signal:
                 is_opposite = (self.active_trade["type"] == "long" and signal["type"] == "short") or \
-                              (self.active_trade["type"] == "short" and signal["type"] == "long")
+                               (self.active_trade["type"] == "short" and signal["type"] == "long")
                 
                 if is_opposite:
-                    print(f"[{time.strftime('%H:%M:%S')}] OPPOSITE SIGNAL DETECTED! Closing current {self.active_trade['type']} to flip.")
-                    self._close_active_trade(current_candle, reason="Opposite Signal")
-                    # After closing, we can immediately open the new signal
-                    self._execute_trade(signal, current_candle)
-                    return history_df
+                    # PRIORITY LOGIC:
+                    # Only flip if it's the SAME strategy OR a higher priority strategy (lower priority number)
+                    current_priority = self.active_trade.get("priority", 10)
+                    new_priority = signal.get("priority", 10)
+                    
+                    should_flip = (signal["strategy_id"] == self.active_trade["strategy"]) or (new_priority < current_priority)
+                    
+                    if should_flip:
+                        # Check elapsed time for safety (2-minute rule)
+                        elapsed_seconds = time.time() - self.active_trade.get("open_time", 0)
+                        if elapsed_seconds > 120:
+                            print(f"[{time.strftime('%H:%M:%S')}] OPPOSITE SIGNAL DETECTED ({signal.get('strategy_name')})! Closing current {self.active_trade['type']} to flip.")
+                            self._close_active_trade(current_candle, reason="Opposite Signal (High Priority)")
+                            # After closing, we can immediately open the new signal
+                            self._execute_trade(signal, current_candle)
+                            return history_df
+                        else:
+                            print(f"[{time.strftime('%H:%M:%S')}] Opposite signal ignored (Trade < 2 mins old).")
+                    else:
+                        print(f"[{time.strftime('%H:%M:%S')}] Opposite signal ignored (Low priority: {signal.get('strategy_name')}).")
 
             # Normal Management (Break-even, Trailing SL, Time Exit, SL/TP)
             self._manage_trade(current_slice.iloc[-1])
@@ -83,6 +112,13 @@ class LiveDemoEngine:
 
         # 4. If no trade is active, look for new entry
         if signal:
+            # SAME CANDLE FLIP PREVENTION
+            if self.history:
+                last_trade = self.history[-1]
+                if last_trade.get("open_candle_time") == current_candle.get("timestamp"):
+                    print(f"[{time.strftime('%H:%M:%S')}] Entry skipped: Already traded on this candle.")
+                    return history_df
+                    
             self._execute_trade(signal, current_candle)
             
         return history_df
@@ -99,9 +135,35 @@ class LiveDemoEngine:
         if stop_distance == 0:
             return
             
+        # 3. Liquidity Check (Tick Volume should be > 50% of Average)
+        vol_avg = current_candle.get("volume_avg", 0)
+        curr_vol = current_candle.get("volume", 0)
+        if vol_avg > 0 and curr_vol < (vol_avg * 0.5):
+             print(f"[{time.strftime('%H:%M:%S')}] 🛑 [ABORTED] Low liquidity! Vol: {curr_vol} < 50% of Avg ({vol_avg:.0f})")
+             return
+             
+        # 4. DYNAMIC RISK SCALING
+        adx = current_candle.get("adx", 0)
+        risk_multiplier = 1.0 # Standard
+        
+        if adx > 40:
+            risk_multiplier = 1.5 # High Confidence Trend
+            print(f"[{time.strftime('%H:%M:%S')}] 🔥 DYNAMIC RISK: High ADX ({adx:.1f}). Increasing risk to 1.5x.")
+        elif adx < 25:
+            risk_multiplier = 0.5 # Low Confidence / Chop
+            print(f"[{time.strftime('%H:%M:%S')}] 💤 DYNAMIC RISK: Low ADX ({adx:.1f}). Reducing risk to 0.5x.")
+        
+        adjusted_risk_amount = risk_amount * risk_multiplier
+        
         # Smarter Lot Calculation
-        lots, actual_risk_pct, is_high_risk = self.risk_engine.calculate_lots(self.balance, risk_amount, stop_distance)
+        lots, actual_risk_pct, should_skip, reason = self.risk_engine.calculate_lots(self.balance, adjusted_risk_amount, stop_distance)
+        
+        if should_skip:
+            print(f"[{time.strftime('%H:%M:%S')}] 🛑 [ABORTED] {reason}")
+            return
+            
         final_risk_amount = (actual_risk_pct / 100) * self.balance
+        is_high_risk = actual_risk_pct > 2.0
         
         # Log detailed strategy breakdown
         print("\n" + "="*50)
@@ -134,12 +196,15 @@ class LiveDemoEngine:
             "lots": lots,
             "strategy": strategy_id,
             "strategy_name": signal.get("strategy_name", "Unknown"),
+            "priority": signal.get("priority", 10),
             "mt5_ticket": ticket,
             "entry_atr": current_candle.get("atr_14", 0),
             "candle_count": 0,
             "be_moved": False,
             "partial_tp_hit": False,
-            "open_time": time.time() # For 2-minute safety buffer
+            "open_time": time.time(), # For 2-minute safety buffer
+            "open_candle_time": current_candle.get("timestamp"),
+            "open_time_str": time.strftime('%Y-%m-%d %H:%M:%S')
         }
         
         print(f"[{time.strftime('%H:%M:%S')}] TRADE ACTIVE | SL: {sl:.2f} | TP: {tp:.2f} | Ticket: {ticket}")
@@ -180,6 +245,14 @@ class LiveDemoEngine:
 
         mt5_order_type = mt5.ORDER_TYPE_BUY if order_type == "long" else mt5.ORDER_TYPE_SELL
         tick = mt5.symbol_info_tick(self.symbol)
+        
+        # 2.5 Spread Gate Protection
+        spread_points = symbol_info.spread
+        max_allowed_spread = 35 # 3.5 pips on Gold is the "efficiency" limit
+        if spread_points > max_allowed_spread:
+            print(f"[{time.strftime('%H:%M:%S')}] 🛑 [ABORTED] High Spread: {spread_points} > {max_allowed_spread} max! Market too expensive.")
+            return None
+
         price = tick.ask if order_type == "long" else tick.bid
         
         # 3. Check Stop Level (Minimum Distance)
@@ -248,12 +321,6 @@ class LiveDemoEngine:
         high = candle["high"]
         low = candle["low"]
         atr = candle.get("atr_14", t.get("entry_atr", 0))
-
-        # 1. TIME-BASED EXIT (Close after 10 candles if stagnant)
-        if t.get("candle_count", 0) >= 10:
-            print(f"[{time.strftime('%H:%M:%S')}] TIME-BASED EXIT! Trade lasted 10 candles. Closing at {current_price:.2f}")
-            self._close_active_trade(candle, reason="Time-Based Exit")
-            return
 
         # 2. MT5 CHECK (If position closed externally)
         if self.use_mt5 and t.get("mt5_ticket"):
@@ -495,7 +562,71 @@ class LiveDemoEngine:
         print(f"New Balance: ${self.balance:.2f} | Today: ${self.risk_engine.daily_loss_accumulator:+.2f}")
         print("="*50 + "\n")
 
+        # Record in history and file
+        t["exit_price"] = close_price
+        t["pnl"] = final_pnl
+        t["exit_reason"] = reason
+        t["status"] = status
+        self.history.append(t)
+        self._log_to_file(t)
+
         self.active_trade = None
+
+    def _fetch_htf_trend(self):
+        """Fetches last 50 H1 bars from MT5 and calculates the trend state."""
+        if not self.use_mt5: return 0
+        
+        # Fetch H1 rates
+        rates = mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_H1, 0, 50)
+        if rates is None or len(rates) < 20:
+            return 0
+            
+        df_h1 = pd.DataFrame(rates)
+        # We only need a basic trend check for efficiency
+        # Using 50-period EMA on H1 as the trend filter
+        df_h1['ema_50'] = df_h1['close'].ewm(span=50, adjust=False).mean()
+        
+        current_close = df_h1['close'].iloc[-1]
+        ema_50 = df_h1['ema_50'].iloc[-1]
+        
+        if current_close > ema_50:
+            return 1 # Bullish
+        elif current_close < ema_50:
+            return -1 # Bearish
+        return 0
+
+    def _initialize_log(self):
+        """Creates the trade_history.csv file with headers if it doesn't already exist."""
+        if not os.path.exists(self.log_file):
+            with open(self.log_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "Open_Time", "Ticket", "Strategy", "Type", "Lots", "Entry", "SL", "TP", 
+                    "Exit_Time", "Exit_Price", "PnL", "Result", "Exit_Reason"
+                ])
+                
+    def _log_to_file(self, t):
+        """Appends a finished trade's record to the CSV file."""
+        try:
+            with open(self.log_file, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    t.get("open_time_str", "N/A"),
+                    t.get("mt5_ticket", "SIM"),
+                    t.get("strategy_name", "Unknown"),
+                    t.get("type", "N/A").upper(),
+                    f"{t.get('lots', 0.0):.2f}",
+                    f"{t.get('entry_price', 0.0):.2f}",
+                    f"{t.get('sl', 0.0):.2f}",
+                    f"{t.get('tp', 0.0):.2f}",
+                    time.strftime('%Y-%m-%d %H:%M:%S'),
+                    f"{t.get('exit_price', 0.0):.2f}",
+                    f"{t.get('pnl', 0.0):.2f}",
+                    t.get("status", "N/A"),
+                    t.get("exit_reason", "N/A")
+                ])
+        except Exception as e:
+            print(f"Error logging to file: {e}")
 
     def _handle_trade_closure(self, reason=""):
         """Special handler for trades closed outside the script (e.g. SL hit on server)"""
@@ -504,6 +635,15 @@ class LiveDemoEngine:
         
         if self.use_mt5 and t.get("mt5_ticket"):
             final_pnl = self._get_mt5_pnl(t["mt5_ticket"])
+            # Determine status
+            status = "PROFIT ✅" if final_pnl > 0.01 else "LOSS ❌"
+            if abs(final_pnl) <= 0.01: status = "BREAK-EVEN ⚖️"
+            t["status"] = status
+            t["exit_price"] = 0.0 # Unknown exactly if closed externally without more work
+            t["exit_reason"] = reason
+            
+            self._log_to_file(t)
+            
             self.risk_engine.update_daily_pnl(final_pnl)
             self.balance += final_pnl
             print(f"[{time.strftime('%H:%M:%S')}] External Trade Closed. PnL: ${final_pnl:.2f} | Reason: {reason}")

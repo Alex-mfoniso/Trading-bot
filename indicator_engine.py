@@ -12,20 +12,22 @@ class IndicatorEngine:
         df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
         df["ema_200"] = df["close"].ewm(span=200, adjust=False).mean()
         
-        # RSI 14
+        # RSI 14 (Wilder's Smoothing)
         delta = df["close"].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
+        gain = delta.where(delta > 0, 0)
+        loss = -delta.where(delta < 0, 0)
+        avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
+        rs = avg_gain / avg_loss
         df["rsi_14"] = 100 - (100 / (1 + rs))
         
-        # ATR 14
+        # ATR 14 (Wilder's Smoothing)
         high_low = df["high"] - df["low"]
         high_close = np.abs(df["high"] - df["close"].shift())
         low_close = np.abs(df["low"] - df["close"].shift())
         ranges = pd.concat([high_low, high_close, low_close], axis=1)
         true_range = np.max(ranges, axis=1)
-        df["atr_14"] = true_range.rolling(14).mean()
+        df["atr_14"] = true_range.ewm(alpha=1/14, adjust=False).mean()
         
         # Volume average
         df["volume_avg"] = df["volume"].rolling(20).mean()
@@ -43,23 +45,24 @@ class IndicatorEngine:
         df['bb_lower'] = df['bb_mid'] - (bb_std * 2)
         df['bb_width'] = df['bb_upper'] - df['bb_lower']
 
-        # ADX (Average Directional Index) - 14 period
-        plus_dm = df['high'].diff()
-        minus_dm = df['low'].diff()
-        plus_dm[plus_dm < 0] = 0
-        minus_dm[minus_dm > 0] = 0
-        minus_dm = abs(minus_dm)
+        # ADX (Average Directional Index) - 14 period (Wilder's Smoothing)
+        plus_dm_raw = df['high'].diff()
+        minus_dm_raw = df['low'].diff()
         
-        # True Range (re-using part of ATR logic)
+        plus_dm = np.where((plus_dm_raw > 0) & (plus_dm_raw > minus_dm_raw), plus_dm_raw, 0)
+        minus_dm = np.where((minus_dm_raw > 0) & (minus_dm_raw > plus_dm_raw), minus_dm_raw, 0)
+        
         tr = pd.concat([df['high'] - df['low'], 
                         abs(df['high'] - df['close'].shift()), 
                         abs(df['low'] - df['close'].shift())], axis=1).max(axis=1)
         
-        atr_adx = tr.rolling(14).mean()
-        plus_di = 100 * (plus_dm.rolling(14).mean() / atr_adx)
-        minus_di = 100 * (minus_dm.rolling(14).mean() / atr_adx)
+        tr_smooth = tr.ewm(alpha=1/14, adjust=False).mean()
+        
+        plus_di = 100 * (pd.Series(plus_dm, index=df.index).ewm(alpha=1/14, adjust=False).mean() / tr_smooth)
+        minus_di = 100 * (pd.Series(minus_dm, index=df.index).ewm(alpha=1/14, adjust=False).mean() / tr_smooth)
+        
         dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
-        df['adx'] = dx.rolling(14).mean()
+        df['adx'] = dx.ewm(alpha=1/14, adjust=False).mean()
 
         # Rolling High/Low (Donchian 20)
         df['highest_20'] = df['high'].rolling(window=20).max()
