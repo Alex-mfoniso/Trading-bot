@@ -1,5 +1,6 @@
 import time
 import MetaTrader5 as mt5
+import threading
 import pandas as pd
 from live_engine import LiveDemoEngine
 from session_engine import SessionEngine
@@ -8,6 +9,10 @@ from session_engine import SessionEngine
 SYMBOL = "XAUUSD"
 TIMEFRAME = mt5.TIMEFRAME_H1
 RISK_PERCENT = 0.01
+
+# --- PUBLIC REPORTING ---
+# Paste your Google Apps Script Web App URL here to enable online Excel logs
+GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbxvq6KZHwPozEWr2OHtFj1-W0cLtME3g_KiCyA6u05Ya0KQK56wqrmj_oxR-SsnL-Odug/exec" 
 
 def get_historical_data(symbol, timeframe, num_bars):
     """
@@ -53,6 +58,20 @@ def setup_mt5():
         return False
         
     return True
+
+def background_monitor(engine):
+    """
+    Background thread that monitors active trades every 1 second.
+    Completely independent of the main candle loop.
+    """
+    print(f"[{time.strftime('%H:%M:%S')}] 🚀 High-Frequency Management Thread Started.")
+    while True:
+        try:
+            engine.monitor_active_trade()
+            time.sleep(1) # React in less than 1 second
+        except Exception as e:
+            # We don't want the monitor thread to ever crash the whole bot
+            time.sleep(5)
 
 def main():
     print("--- STARTING Phase 5: METATRADER 5 DEMO INTEGRATION ---")
@@ -110,7 +129,7 @@ def main():
         mt5.shutdown()
         return
 
-    # 2. Initialize our Engine
+    # 2. Start-up Configuration
     demo = LiveDemoEngine(
         initial_balance=balance, 
         risk_per_trade=RISK_PERCENT, 
@@ -119,10 +138,22 @@ def main():
         symbol=SYMBOL
     )
     
+    # 2.5 Optional Online Reporting
+    if GOOGLE_SHEET_URL:
+        demo.google_sheet_url = GOOGLE_SHEET_URL
+        print(f"[{time.strftime('%H:%M:%S')}] ☁️ Cloud Reporting Enabled: {GOOGLE_SHEET_URL}")
+    else:
+        print(f"[{time.strftime('%H:%M:%S')}] 📄 Local Logging Only (Google Sheet URL not set).")
+
+    
     # Track the last known candle timestamp so we only process new candles once
     last_processed_time = history_df.iloc[-1]['timestamp']
     
     print(f"Waiting for new {SYMBOL} {tf_display} candles from MT5...")
+    
+    # --- START HIGH-FREQUENCY MONITOR THREAD ---
+    monitor_thread = threading.Thread(target=background_monitor, args=(demo,), daemon=True)
+    monitor_thread.start()
     
     # 3. Check initial market status
     is_open, status_msg = SessionEngine.get_market_status()
@@ -137,7 +168,7 @@ def main():
                 print(f"\n[{time.strftime('%H:%M:%S')}] MARKET STATUS ALERT: {current_msg}")
                 last_market_status = current_open
 
-            # We poll MT5 periodically. For a 1H strategy, pinging every 10 seconds is more than enough
+            # Poll MT5 for new closed candles
             time.sleep(10)
             
             latest_candle = get_current_candle(SYMBOL, TIMEFRAME)
