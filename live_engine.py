@@ -111,16 +111,14 @@ class LiveDemoEngine:
                         print(f"[{time.strftime('%H:%M:%S')}] Opposite signal ignored (Low priority: {signal.get('strategy_name')}).")
 
             # 3. Check for SL/TP on active trade (Thread-safe)
-        with self.trade_lock:
-            # Real-time monitoring for SL/TP/Partial TP (Independent of candle close)
-            # This is now handled by the background thread, but we check here too for safety
-            self.monitor_active_trade()
-            return history_df
-
-        # 4. Check for existing trade
-        with self.trade_lock:
-            if self.active_trade:
-                return history_df
+            with self.trade_lock:
+                # Real-time monitoring for SL/TP/Partial TP (Independent of candle close)
+                # This is now handled by the background thread, but we check here too for safety
+                self.monitor_active_trade()
+                
+                # If trade is still active, we don't open another one yet
+                if self.active_trade:
+                    return history_df
                 
             # 4. If no trade is active, look for new entry
             if signal:
