@@ -8,7 +8,7 @@ from backtest_engine import BacktestEngine
 from performance import PerformanceAnalyzer
 
 # --- Configuration ---
-SYMBOL = "XAUUSD"
+SYMBOL = "CADCHF"
 TIMEFRAME = mt5.TIMEFRAME_H1 # USER is likely running H1
 NUM_BARS = 100 # ~4 days of H1 data
 

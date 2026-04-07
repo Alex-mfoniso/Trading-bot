@@ -6,7 +6,7 @@ from live_engine import LiveDemoEngine
 from session_engine import SessionEngine
 
 # --- Configuration ---
-SYMBOL = "XAUUSD"
+SYMBOL = "CADCHF"
 TIMEFRAME = mt5.TIMEFRAME_H1
 RISK_PERCENT = 0.01
 

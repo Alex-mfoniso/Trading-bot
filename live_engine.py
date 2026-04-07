@@ -13,7 +13,7 @@ import threading
 from risk_engine import RiskEngine
 
 class LiveDemoEngine:
-    def __init__(self, initial_balance=5000, risk_per_trade=0.005, num_strategies=3, use_mt5=False, symbol="XAUUSD", ignore_sessions=False):
+    def __init__(self, initial_balance=5000, risk_per_trade=0.005, num_strategies=3, use_mt5=False, symbol="CADCHF", ignore_sessions=False):
         self.strategy_engine = StrategyEngine()
         self.risk_engine = RiskEngine(
             risk_percent=risk_per_trade, 

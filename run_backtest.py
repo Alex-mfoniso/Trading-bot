@@ -8,7 +8,7 @@ from backtest_engine import BacktestEngine
 from performance import PerformanceAnalyzer
 
 # --- Configuration ---
-SYMBOL = "XAUUSD"
+SYMBOL = "CADCHF"
 
 def get_historical_data(symbol, timeframe, num_bars):
     """
