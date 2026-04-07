@@ -13,11 +13,11 @@ import threading
 from risk_engine import RiskEngine
 
 class LiveDemoEngine:
-    def __init__(self, initial_balance=5000, risk_per_trade=0.005, num_strategies=3, use_mt5=False, symbol="XAUUSD"):
+    def __init__(self, initial_balance=5000, risk_per_trade=0.005, num_strategies=3, use_mt5=False, symbol="XAUUSD", ignore_sessions=False):
         self.strategy_engine = StrategyEngine()
         self.risk_engine = RiskEngine(
             risk_percent=risk_per_trade, 
-            fixed_risk_usd=25.0, 
+            fixed_risk_usd=initial_balance * risk_per_trade, 
             daily_loss_limit=150.0, # $150 as per Goat Funded Trader rules
             max_overall_loss=500.0, # 10% as per GFT
             initial_balance=initial_balance,
@@ -30,6 +30,7 @@ class LiveDemoEngine:
         self.num_strategies = num_strategies
         self.use_mt5 = use_mt5
         self.symbol = symbol
+        self.ignore_sessions = ignore_sessions
         self.google_sheet_url = None # Set this in run_mt5_demo.py
         self.htf_trend = 0 # 1: Bullish, -1: Bearish, 0: Unknown/Neutral
         self.log_file = "trade_history.csv"
@@ -78,7 +79,7 @@ class LiveDemoEngine:
                 print(f"[{time.strftime('%H:%M:%S')}] HTF TREND (H1): {trend_str}")
         
         # 2. Check for new signals ALWAYS (even if trade is active, for opposite signals)
-        signal = self.strategy_engine.check_strategy(current_slice, self.num_strategies, htf_trend=self.htf_trend)
+        signal = self.strategy_engine.check_strategy(current_slice, self.num_strategies, htf_trend=self.htf_trend, ignore_sessions=self.ignore_sessions)
          # 3. If trade is active, manage it
         if self.active_trade:
             self.active_trade["candle_count"] = self.active_trade.get("candle_count", 0) + 1
@@ -120,16 +121,16 @@ class LiveDemoEngine:
                 if self.active_trade:
                     return history_df
                 
-            # 4. If no trade is active, look for new entry
-            if signal:
-                # SAME CANDLE FLIP PREVENTION
-                if self.history:
-                    last_trade = self.history[-1]
-                    if last_trade.get("open_candle_time") == current_candle.get("timestamp"):
-                        print(f"[{time.strftime('%H:%M:%S')}] Entry skipped: Already traded on this candle.")
-                        return history_df
-                        
-                self._execute_trade(signal, current_candle)
+        # 4. If no trade is active, look for new entry
+        if signal:
+            # SAME CANDLE FLIP PREVENTION
+            if self.history:
+                last_trade = self.history[-1]
+                if last_trade.get("open_candle_time") == current_candle.get("timestamp"):
+                    print(f"[{time.strftime('%H:%M:%S')}] Entry skipped: Already traded on this candle.")
+                    return history_df
+                    
+            self._execute_trade(signal, current_candle)
             
         return history_df
         

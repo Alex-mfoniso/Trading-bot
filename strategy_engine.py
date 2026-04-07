@@ -1,14 +1,14 @@
 import time
 
 class StrategyEngine:
-    def check_strategy(self, current_slice, num_strategies=5, htf_trend=0):
+    def check_strategy(self, current_slice, num_strategies=5, htf_trend=0, ignore_sessions=False):
         if len(current_slice) < 2:
             return None
             
         current_candle = current_slice.iloc[-1]
         in_session = current_candle.get("is_killzone", True)
         
-        if not in_session:
+        if not in_session and not ignore_sessions:
             return None
 
         adx = current_candle.get("adx", 0)
@@ -67,8 +67,8 @@ class StrategyEngine:
         adx = candle.get("adx", 0)
         trend_state = candle.get("trend_state", 0) # 1 = Bullish structure, -1 = Bearish
         
-        if adx < 25:
-            return None
+        # if adx < 25:
+        #     return None
 
         trend_up = candle["ema_50"] > candle["ema_200"] and trend_state >= 0
         trend_down = candle["ema_50"] < candle["ema_200"] and trend_state <= 0
@@ -106,8 +106,8 @@ class StrategyEngine:
         adx = candle.get("adx", 0)
         trend_state = candle.get("trend_state", 0)
         
-        if adx < 25:
-            return None
+        # if adx < 25:
+        #     return None
 
         prev_candle = slice.iloc[-2]
         vol_check = candle["volume"] > candle["volume_avg"]

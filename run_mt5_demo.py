@@ -121,6 +121,9 @@ def main():
     auto_repeat_input = input("Enable Auto-Repeat (automatically wait for next candle)? (y/n) [Default: y]: ").strip().lower()
     auto_repeat = auto_repeat_input != 'n'
 
+    ignore_sessions_input = input("Ignore Session Times (i.e. Trade anytime)? (y/n) [Default: n]: ").strip().lower()
+    ignore_sessions = ignore_sessions_input == 'y'
+
     # 1. Fetch initial warmup history (e.g., 500 bars)
     print("Fetching historical data for Engine warmup...")
     history_df = get_historical_data(SYMBOL, TIMEFRAME, 500)
@@ -135,7 +138,8 @@ def main():
         risk_per_trade=RISK_PERCENT, 
         num_strategies=num_strategies,
         use_mt5=enable_execution,
-        symbol=SYMBOL
+        symbol=SYMBOL,
+        ignore_sessions=ignore_sessions
     )
     
     # 2.5 Optional Online Reporting
