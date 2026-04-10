@@ -13,7 +13,7 @@ import threading
 from risk_engine import RiskEngine
 
 class LiveDemoEngine:
-    def __init__(self, initial_balance=5000, risk_per_trade=0.005, num_strategies=3, use_mt5=False, symbol="XAUUSD", ignore_sessions=False):
+    def __init__(self, initial_balance=5000, risk_per_trade=0.005, num_strategies=3, use_mt5=False, symbol="XAUUSD", ignore_sessions=False, max_trades=2):
         self.strategy_engine = StrategyEngine()
         self.risk_engine = RiskEngine(
             risk_percent=risk_per_trade, 
@@ -24,13 +24,14 @@ class LiveDemoEngine:
             target_profit=400.0 # 8% Target for Phase 1
         )
         self.balance = initial_balance
-        self.active_trade = None
-        self.trade_lock = threading.Lock() # Ensure real-time monitor and candle loop don't fight
+        self.active_trades = {} # Dictionary of active trades keyed by ticket/ID
+        self.trade_lock = threading.RLock()
         self.history = []
         self.num_strategies = num_strategies
         self.use_mt5 = use_mt5
         self.symbol = symbol
         self.ignore_sessions = ignore_sessions
+        self.max_trades = max_trades
         self.google_sheet_url = None # Set this in run_mt5_demo.py
         self.htf_trend = 0 # 1: Bullish, -1: Bearish, 0: Unknown/Neutral
         self.log_file = "trade_history.csv"
@@ -41,98 +42,90 @@ class LiveDemoEngine:
 
     def on_new_candle(self, new_candle_row, history_df):
         """
-        Simulates receiving a closed 1H candle from a Websocket or REST API
+        Ingests a new closed candle and triggers signal checks.
         """
         # Append new candle to our rolling history
         if not history_df.empty:
+            # Check if this candle is already the last one to avoid duplicates
+            if history_df.iloc[-1]['timestamp'] == new_candle_row['timestamp']:
+                return history_df
             history_df = pd.concat([history_df, pd.DataFrame([new_candle_row])], ignore_index=True)
         else:
             history_df = pd.DataFrame([new_candle_row])
             
         print(f"[{time.strftime('%H:%M:%S')}] Received new candle. Total rolling history: {len(history_df)} bars.")
         
+        # Trigger signal check and trade management
+        signal, candle = self._process_latest_state(history_df)
+        return history_df, signal, candle
+
+    def _process_latest_state(self, history_df):
+        """
+        Core logic to manage active trades and look for new signals.
+        Returns (signal, candle) if a new trade is recommended, else (None, None).
+        """
         # 1. RISK CHECK (Prop Firm Rules)
         allowed, reason = self.risk_engine.is_trading_allowed(self.balance)
         if not allowed:
-            print(f"[{time.strftime('%H:%M:%S')}] 🛑 [ABORTED] {reason}")
-            return history_df
+            # print(f"[{time.strftime('%H:%M:%S')}] 🛑 [ABORTED] {reason}")
+            return
         
-        # We need a decent chunk of history to compute 200 EMA and structure comfortably
-        if len(history_df) < 250: # Adjusted from 250 to 200 for current_slice, but 250 is safer for full indicators
-            return history_df
+        if len(history_df) < 250:
+            return
             
-        # For 1H bars, recomputing columns on a rolling 250-bar window takes ms.
-        # Ensure we have enough data for indicators and structure
-        window = history_df.tail(250).copy() # Use a larger window for indicator calculation
+        window = history_df.tail(250).copy()
         window = IndicatorEngine.add_features(window)
         window = StructureEngine.add_structure(window, left_bars=5, right_bars=5)
         window = SessionEngine.add_sessions(window)
 
-        current_slice = window.tail(200) # Use a smaller, processed slice for strategy checks
+        current_slice = window.tail(200)
         current_candle = current_slice.iloc[-1]
 
-        # 1.5 MTF TREND CHECK (Fetching H1 trend from MT5 if enabled)
+        # 1.5 MTF TREND CHECK
         if self.use_mt5:
             self.htf_trend = self._fetch_htf_trend()
             if self.htf_trend != 0:
                 trend_str = "BULLISH 🟢" if self.htf_trend == 1 else "BEARISH 🔴"
                 print(f"[{time.strftime('%H:%M:%S')}] HTF TREND (H1): {trend_str}")
         
-        # 2. Check for new signals ALWAYS (even if trade is active, for opposite signals)
+        # 2. Check for new signals
         signal = self.strategy_engine.check_strategy(current_slice, self.num_strategies, htf_trend=self.htf_trend, ignore_sessions=self.ignore_sessions)
-         # 3. If trade is active, manage it
-        if self.active_trade:
-            self.active_trade["candle_count"] = self.active_trade.get("candle_count", 0) + 1
-            
-            # CHECK FOR OPPOSITE SIGNAL EXIT (Sensible check)
-            if signal:
-                is_opposite = (self.active_trade["type"] == "long" and signal["type"] == "short") or \
-                               (self.active_trade["type"] == "short" and signal["type"] == "long")
-                
-                if is_opposite:
-                    # PRIORITY LOGIC:
-                    # Only flip if it's the SAME strategy OR a higher priority strategy (lower priority number)
-                    current_priority = self.active_trade.get("priority", 10)
-                    new_priority = signal.get("priority", 10)
-                    
-                    should_flip = (signal["strategy_id"] == self.active_trade["strategy"]) or (new_priority < current_priority)
-                    
-                    if should_flip:
-                        # Check elapsed time for safety (2-minute rule)
-                        elapsed_seconds = time.time() - self.active_trade.get("open_time", 0)
-                        if elapsed_seconds > 120:
-                            print(f"[{time.strftime('%H:%M:%S')}] OPPOSITE SIGNAL DETECTED ({signal.get('strategy_name')})! Closing current {self.active_trade['type']} to flip.")
-                            self._close_active_trade(current_candle, reason="Opposite Signal (High Priority)")
-                            # After closing, we can immediately open the new signal
-                            self._execute_trade(signal, current_candle)
-                            return history_df
-                        else:
-                            print(f"[{time.strftime('%H:%M:%S')}] Opposite signal ignored (Trade < 2 mins old).")
-                    else:
-                        print(f"[{time.strftime('%H:%M:%S')}] Opposite signal ignored (Low priority: {signal.get('strategy_name')}).")
+        
+        # 3. Handle active trade management
+        with self.trade_lock:
+            # Create a copy of keys to avoid modification during iteration issues
+            tickets = list(self.active_trades.keys())
+            for t_id in tickets:
+                if t_id in self.active_trades:
+                    self.monitor_active_trade(self.active_trades[t_id], current_price_sim=current_candle['close'])
 
-            # 3. Check for SL/TP on active trade (Thread-safe)
-            with self.trade_lock:
-                # Real-time monitoring for SL/TP/Partial TP (Independent of candle close)
-                # This is now handled by the background thread, but we check here too for safety
-                self.monitor_active_trade()
-                
-                # If trade is still active, we don't open another one yet
-                if self.active_trade:
-                    return history_df
-                
-        # 4. If no trade is active, look for new entry
+        # 4. Look for new entry
+        if len(self.active_trades) >= self.max_trades:
+            # print(f"[{time.strftime('%H:%M:%S')}] Max trades ({self.max_trades}) reached. Skipping signal search.")
+            return None, None
+
         if signal:
-            # SAME CANDLE FLIP PREVENTION
+            # SAME CANDLE FLIP PREVENTION (Per Strategy)
             if self.history:
                 last_trade = self.history[-1]
-                if last_trade.get("open_candle_time") == current_candle.get("timestamp"):
-                    print(f"[{time.strftime('%H:%M:%S')}] Entry skipped: Already traded on this candle.")
-                    return history_df
-                    
-            self._execute_trade(signal, current_candle)
+            # SAME STRATEGY PREVENTION
+            with self.trade_lock:
+                already_running = any(t.get("strategy") == signal["strategy_id"] for t in self.active_trades.values())
+                if already_running:
+                    # print(f"DEBUG: Already in {signal['strategy_id']}. Skipping duplicate.")
+                    return None, None
             
-        return history_df
+            return signal, current_candle
+            
+        return None, None
+
+    def heartbeat(self, history_df):
+        """
+        Call this frequently to ensure the bot isn't 'idle'.
+        If no trade is active, it re-checks signals from the last known state.
+        """
+        signal, candle = self._process_latest_state(history_df)
+        return history_df, signal, candle
         
     def _execute_trade(self, signal, current_candle):
         entry = signal["entry"]
@@ -190,15 +183,11 @@ class LiveDemoEngine:
 
         # Execute on MT5 if enabled
         ticket = None
-        if self.use_mt5:
-            ticket = self._send_mt5_order(signal["type"], lots, sl, tp)
-            if not ticket:
-                return # Stop if MT5 failed
-
+        
         # Calculate TP1 (1:1 Risk/Reward)
         tp_1 = entry + (entry - sl) if signal["type"] == "long" else entry - (sl - entry)
 
-        self.active_trade = {
+        new_trade = {
             "type": signal["type"],
             "entry_price": entry,
             "sl": sl,
@@ -209,7 +198,6 @@ class LiveDemoEngine:
             "strategy": strategy_id,
             "strategy_name": signal.get("strategy_name", "Unknown"),
             "priority": signal.get("priority", 10),
-            "mt5_ticket": ticket,
             "entry_atr": current_candle.get("atr_14", 0),
             "candle_count": 0,
             "be_moved": False,
@@ -218,10 +206,25 @@ class LiveDemoEngine:
             "open_candle_time": current_candle.get("timestamp"),
             "open_time_str": time.strftime('%Y-%m-%d %H:%M:%S')
         }
-        
-        print(f"[{time.strftime('%H:%M:%S')}] TRADE ACTIVE | SL: {sl:.2f} | TP: {tp:.2f} | Ticket: {ticket}")
-        if is_high_risk:
-            print(f"[{time.strftime('%H:%M:%S')}] [WARNING] High risk trade detected!")
+
+        if self.use_mt5:
+            ticket = self._send_mt5_order(signal["type"], lots, sl, tp)
+            if not ticket:
+                return # Stop if MT5 failed
+            # Register as active trade
+            new_trade["mt5_ticket"] = ticket
+            with self.trade_lock:
+                self.active_trades[ticket] = new_trade
+            
+            print(f"[{time.strftime('%H:%M:%S')}] TRADE ACTIVE | SL: {new_trade['sl']} | TP: {new_trade['tp']} | Ticket: {ticket}")
+        else:
+            # Simulation Mode
+            # Generate a unique ID for simulation
+            sim_id = f"SIM_{int(time.time())}_{signal['strategy_id']}"
+            new_trade["sim_id"] = sim_id
+            with self.trade_lock:
+                self.active_trades[sim_id] = new_trade
+            print(f"[{time.strftime('%H:%M:%S')}] Simulation Trade Opened: {sim_id}")
 
     def _send_mt5_order(self, order_type, lots, sl, tp):
         """
@@ -324,24 +327,24 @@ class LiveDemoEngine:
 
         return ticket
 
-    def monitor_active_trade(self):
+    def monitor_active_trade(self, t, current_price_sim=None):
         """
         High-frequency monitoring for Partial TP, Trailing Stop, and SL/TP.
         Should be called every few seconds, independent of candle timeframe.
+        'current_price_sim' is used in simulation mode to check stops on candle close.
         """
-        if not self.use_mt5: return # No ticks in simulation mode
+        if not self.use_mt5 and current_price_sim is None: return 
         
         with self.trade_lock:
-            t = self.active_trade
             if not t:
                 return
     
             # 1. MT5 CHECK (If position closed externally)
-            if t.get("mt5_ticket"):
+            if self.use_mt5 and t.get("mt5_ticket"):
                 position = mt5.positions_get(ticket=t["mt5_ticket"])
                 if not position:
                     print(f"[{time.strftime('%H:%M:%S')}] MT5 Position {t['mt5_ticket']} closed externally (SL/TP).")
-                    self._handle_trade_closure(reason="External Close (MT5)")
+                    self._handle_trade_closure(t, reason="External Close (MT5)")
                     return
                 
                 # Fetch latest tick for real-time price
@@ -353,13 +356,35 @@ class LiveDemoEngine:
                 current_price = tick.bid if t["type"] == "long" else tick.ask
                 high_price = tick.bid # For Long targets
                 low_price = tick.ask # For Short targets
+            elif not self.use_mt5 and current_price_sim is not None:
+                # SIMULATION MODE
+                current_price = current_price_sim
+                high_price = current_price # Simplification: use close price
+                low_price = current_price 
             else:
                 return
 
+        # 1.5 SIMULATION SL/TP CHECK
+        if not self.use_mt5:
+            is_long = t["type"] == "long"
+            hit_sl = (is_long and low_price <= t["sl"]) or (not is_long and high_price >= t["sl"])
+            hit_tp = (is_long and high_price >= t["tp"]) or (not is_long and low_price <= t["tp"])
+            
+            if hit_sl:
+                print(f"[{time.strftime('%H:%M:%S')}] 🛑 [SIM] STOP LOSS HIT! Price: {current_price:.2f} | SL: {t['sl']:.2f}")
+                self._close_active_trade(t, {"close": t["sl"]}, reason="Stop Loss (Sim)")
+                return
+            if hit_tp:
+                print(f"[{time.strftime('%H:%M:%S')}] 🎯 [SIM] TAKE PROFIT HIT! Price: {current_price:.2f} | TP: {t['tp']:.2f}")
+                self._close_active_trade(t, {"close": t["tp"]}, reason="Take Profit (Sim)")
+                return
+
         # 2. SAFETY BUFFER (2-Minute Rule)
-        elapsed_seconds = time.time() - t["open_time"]
-        if elapsed_seconds < 120:
-             return
+        # Skip buffer for simulation if it's based on candle close
+        if self.use_mt5:
+            elapsed_seconds = time.time() - t["open_time"]
+            if elapsed_seconds < 120:
+                 return
 
         atr = t.get("entry_atr", 0)
 
@@ -370,13 +395,13 @@ class LiveDemoEngine:
             # Partial TP: Close 50% at 1:1 R:R
             if not t.get("partial_tp_hit", False) and high_price >= t["tp_1"]:
                 print(f"[{time.strftime('%H:%M:%S')}] 🎯 [REAL-TIME] PARTIAL TP HIT (Long)! Price: {current_price:.2f} >= TP1: {t['tp_1']:.2f}")
-                self._partial_close_trade(0.5, reason="Partial TP")
+                self._partial_close_trade(t, 0.5, reason="Partial TP")
                 t["partial_tp_hit"] = True
                 
                 # Move to Break-Even immediately
                 if not t.get("be_moved", False):
                     new_sl = t["entry_price"] + (atr * 0.1)
-                    self._modify_trade_sl(new_sl)
+                    self._modify_trade_sl(t, new_sl)
                     t["be_moved"] = True
                     t["sl"] = new_sl
 
@@ -384,7 +409,7 @@ class LiveDemoEngine:
             if not t.get("be_moved", False) and profit_points > (atr * 1.0):
                 print(f"[{time.strftime('%H:%M:%S')}] [REAL-TIME] MOVE TO BREAK-EVEN! Profit > 1 ATR.")
                 new_sl = t["entry_price"] + (atr * 0.1)
-                self._modify_trade_sl(new_sl)
+                self._modify_trade_sl(t, new_sl)
                 t["be_moved"] = True
                 t["sl"] = new_sl
 
@@ -393,7 +418,7 @@ class LiveDemoEngine:
                 suggested_sl = current_price - (atr * 1.5)
                 if suggested_sl > t["sl"]:
                     print(f"[{time.strftime('%H:%M:%S')}] [REAL-TIME] TRAILING SL! New Long SL: {suggested_sl:.2f}")
-                    self._modify_trade_sl(suggested_sl)
+                    self._modify_trade_sl(t, suggested_sl)
                     t["sl"] = suggested_sl
 
         elif t["type"] == "short":
@@ -402,12 +427,12 @@ class LiveDemoEngine:
             # Partial TP
             if not t.get("partial_tp_hit", False) and low_price <= t["tp_1"]:
                 print(f"[{time.strftime('%H:%M:%S')}] 🎯 [REAL-TIME] PARTIAL TP HIT (Short)! Price: {current_price:.2f} <= TP1: {t['tp_1']:.2f}")
-                self._partial_close_trade(0.5, reason="Partial TP")
+                self._partial_close_trade(t, 0.5, reason="Partial TP")
                 t["partial_tp_hit"] = True
                 
                 if not t.get("be_moved", False):
                     new_sl = t["entry_price"] - (atr * 0.1)
-                    self._modify_trade_sl(new_sl)
+                    self._modify_trade_sl(t, new_sl)
                     t["be_moved"] = True
                     t["sl"] = new_sl
 
@@ -415,7 +440,7 @@ class LiveDemoEngine:
             if not t.get("be_moved", False) and profit_points > (atr * 1.0):
                 print(f"[{time.strftime('%H:%M:%S')}] [REAL-TIME] MOVE TO BREAK-EVEN! Profit > 1 ATR.")
                 new_sl = t["entry_price"] - (atr * 0.1)
-                self._modify_trade_sl(new_sl)
+                self._modify_trade_sl(t, new_sl)
                 t["be_moved"] = True
                 t["sl"] = new_sl
 
@@ -424,11 +449,10 @@ class LiveDemoEngine:
                 suggested_sl = current_price + (atr * 1.5)
                 if suggested_sl < t["sl"]:
                     print(f"[{time.strftime('%H:%M:%S')}] [REAL-TIME] TRAILING SL! New Short SL: {suggested_sl:.2f}")
-                    self._modify_trade_sl(suggested_sl)
+                    self._modify_trade_sl(t, suggested_sl)
                     t["sl"] = suggested_sl
 
-    def _partial_close_trade(self, close_percent, reason=""):
-        t = self.active_trade
+    def _partial_close_trade(self, t, close_percent, reason=""):
         if not t: return
 
         close_lots = t["lots"] * close_percent
@@ -473,8 +497,8 @@ class LiveDemoEngine:
             t["lots"] -= close_lots
             print(f"[{time.strftime('%H:%M:%S')}] Simulation Partial Close: ${pnl:.2f} added. Remaining lots: {t['lots']:.2f}")
 
-    def _modify_trade_sl(self, new_sl):
-        if not self.use_mt5 or not self.active_trade.get("mt5_ticket"):
+    def _modify_trade_sl(self, t, new_sl):
+        if not self.use_mt5 or not t.get("mt5_ticket"):
             return
             
         # Round new_sl properly
@@ -490,9 +514,9 @@ class LiveDemoEngine:
         stop_level_pts = max(symbol_info.trade_stops_level, 35) 
         stop_level = stop_level_pts * symbol_info.point
         
-        current_price = tick.bid if self.active_trade["type"] == "long" else tick.ask
+        current_price = tick.bid if t["type"] == "long" else tick.ask
         
-        if self.active_trade["type"] == "long":
+        if t["type"] == "long":
             if rounded_sl > current_price - stop_level:
                 # print(f"DEBUG: Skipping SL {rounded_sl}. Too close to {current_price} (Buffer: {stop_level})")
                 return 
@@ -504,9 +528,9 @@ class LiveDemoEngine:
         request = {
             "action": mt5.TRADE_ACTION_SLTP,
             "symbol": self.symbol,
-            "position": self.active_trade["mt5_ticket"],
+            "position": t["mt5_ticket"],
             "sl": float(rounded_sl),
-            "tp": float(self.active_trade["tp"]) # Keep existing TP
+            "tp": float(t["tp"]) # Keep existing TP
         }
         res = mt5.order_send(request)
         if res.retcode != mt5.TRADE_RETCODE_DONE:
@@ -533,8 +557,7 @@ class LiveDemoEngine:
 
         return 0.0
 
-    def _close_active_trade(self, candle, reason=""):
-        t = self.active_trade
+    def _close_active_trade(self, t, candle, reason=""):
         if not t: return
 
         close_price = candle["close"]
@@ -593,7 +616,12 @@ class LiveDemoEngine:
         
         self.balance += final_pnl
         print(f"New Balance: ${self.balance:.2f} | Today: ${self.risk_engine.daily_loss_accumulator:+.2f}")
-        print("="*50 + "\n")
+        
+        # Remove from active trades
+        t_id = t.get("mt5_ticket") or t.get("sim_id")
+        with self.trade_lock:
+            if t_id in self.active_trades:
+                del self.active_trades[t_id]
 
         # Record in history and file
         t["exit_price"] = close_price
@@ -602,8 +630,6 @@ class LiveDemoEngine:
         t["status"] = status
         self.history.append(t)
         self._log_to_file(t)
-
-        self.active_trade = None
 
     def _fetch_htf_trend(self):
         """Fetches last 50 H1 bars from MT5 and calculates the trend state."""
@@ -697,9 +723,8 @@ class LiveDemoEngine:
         except Exception as e:
             print(f"[{time.strftime('%H:%M:%S')}] ☁️ Error syncing to Google Sheets: {e}")
 
-    def _handle_trade_closure(self, reason=""):
+    def _handle_trade_closure(self, t, reason=""):
         """Special handler for trades closed outside the script (e.g. SL hit on server)"""
-        t = self.active_trade
         if not t: return
         
         if self.use_mt5 and t.get("mt5_ticket"):
@@ -717,4 +742,70 @@ class LiveDemoEngine:
             self.balance += final_pnl
             print(f"[{time.strftime('%H:%M:%S')}] External Trade Closed. PnL: ${final_pnl:.2f} | Reason: {reason}")
             
-        self.active_trade = None
+        t_id = t.get("mt5_ticket") or t.get("sim_id")
+        with self.trade_lock:
+            if t_id in self.active_trades:
+                del self.active_trades[t_id]
+
+    def recover_active_trade(self, history_df):
+        """
+        Attempts to find and resume tracking of an existing open position on MT5.
+        """
+        if not self.use_mt5:
+            return
+
+        from datetime import datetime
+        print(f"[{time.strftime('%H:%M:%S')}] Checking for existing open positions to recover...")
+        
+        positions = mt5.positions_get(symbol=self.symbol)
+        if positions is None or len(positions) == 0:
+            print(f"[{time.strftime('%H:%M:%S')}] No active positions found for {self.symbol}.")
+            return
+
+        # Estimate ATR once for all recovered trades
+        current_atr = 0
+        if len(history_df) >= 200:
+            try:
+                window = history_df.tail(250).copy()
+                window = IndicatorEngine.add_features(window)
+                if not window.empty:
+                    current_atr = window.iloc[-1].get("atr_14", 0)
+            except Exception as e:
+                print(f"[{time.strftime('%H:%M:%S')}] Note: Could not calculate dynamic recovery ATR ({e}). Using 0.")
+
+        for target_pos in positions:
+            # Reconstruct state
+            entry = target_pos.price_open
+            sl = target_pos.sl
+            tp = target_pos.tp
+            trade_type = "long" if target_pos.type == mt5.POSITION_TYPE_BUY else "short"
+            
+            # Calculate TP1 (1:1 Risk/Reward) if possible
+            tp_1 = entry + (entry - sl) if trade_type == "long" else entry - (sl - entry)
+            if sl == 0: tp_1 = entry # Safety
+
+            recovered_trade = {
+                "type": trade_type,
+                "entry_price": entry,
+                "sl": sl,
+                "tp": tp,
+                "tp_1": tp_1,
+                "lots": target_pos.volume,
+                "initial_lots": target_pos.volume,
+                "strategy": "Recovered",
+                "strategy_name": "Recovered Trade",
+                "priority": 10,
+                "mt5_ticket": target_pos.ticket,
+                "entry_atr": current_atr,
+                "candle_count": 0,
+                "be_moved": False,
+                "partial_tp_hit": False,
+                "open_time": target_pos.time, 
+                "open_candle_time": None, # Unknown
+                "open_time_str": datetime.fromtimestamp(target_pos.time).strftime('%Y-%m-%d %H:%M:%S')
+            }
+            
+            with self.trade_lock:
+                self.active_trades[target_pos.ticket] = recovered_trade
+            
+            print(f"[{time.strftime('%H:%M:%S')}] 🔄 RECOVERED ACTIVE TRADE | Ticket: {target_pos.ticket} | {trade_type.upper()} | Entry: {entry} | SL: {sl}")

@@ -1,6 +1,7 @@
 import time
 import MetaTrader5 as mt5
 import threading
+import msvcrt
 import pandas as pd
 from live_engine import LiveDemoEngine
 from session_engine import SessionEngine
@@ -72,6 +73,44 @@ def background_monitor(engine):
         except Exception as e:
             # We don't want the monitor thread to ever crash the whole bot
             time.sleep(5)
+
+def timed_input(prompt, timeout=60, default='n'):
+    """Wait for user input with a timeout (Windows only)."""
+    print(f"{prompt} (Auto-skip in {timeout}s) [y/n]: ", end="", flush=True)
+    start_time = time.time()
+    input_str = ""
+    while True:
+        if msvcrt.kbhit():
+            char = msvcrt.getche().decode('utf-8').lower()
+            if char in ['\r', '\n']:
+                print() # New line after enter
+                return input_str.strip() or default
+            input_str += char
+        if time.time() - start_time > timeout:
+            print(f"\n[TIMEOUT] No response. Defaulting to '{default}'.")
+            return default
+        time.sleep(0.1)
+
+def handle_signal_approval(demo, res):
+    """Processes the result of an engine step and handles manual approval."""
+    if not isinstance(res, tuple):
+        return res # Return history_df as is if old format (safety)
+    
+    history_df, signal, candle = res
+    if signal:
+        print(f"\n==================================================")
+        print(f"[{time.strftime('%H:%M:%S')}] 🔔 SIGNAL DETECTED: {signal.get('strategy_name', 'Unknown')}")
+        print(f"Logic:   {signal.get('description', '')}")
+        print(f"Trigger: {signal.get('trigger_details', '')}")
+        print(f"--------------------------------------------------")
+        
+        ans = timed_input("EXECUTE THIS TRADE?", timeout=60, default='n')
+        if ans == 'y':
+            demo._execute_trade(signal, candle)
+        else:
+            print(f"[{time.strftime('%H:%M:%S')}] Signal SKIPPED or timed out.")
+            
+    return history_df
 
 def main():
     print("--- STARTING Phase 5: METATRADER 5 DEMO INTEGRATION ---")
@@ -149,6 +188,10 @@ def main():
     else:
         print(f"[{time.strftime('%H:%M:%S')}] 📄 Local Logging Only (Google Sheet URL not set).")
 
+    # 2.7 RECOVERY: Check for existing trades from previous session
+    if demo.use_mt5:
+        demo.recover_active_trade(history_df)
+
     
     # Track the last known candle timestamp so we only process new candles once
     last_processed_time = history_df.iloc[-1]['timestamp']
@@ -181,17 +224,17 @@ def main():
                 
             latest_time = latest_candle['timestamp']
             
-            # If the timestamp of the last *closed* candle is newer than our recorded one
+            # Process new closed candles
             if latest_time > last_processed_time:
                 print(f"\n[{time.strftime('%H:%M:%S')}] New {tf_display} closed candle detected at {latest_time}!")
                 last_processed_time = latest_time
                 
                 # Check for trade
-                old_balance = demo.balance
-                history_df = demo.on_new_candle(latest_candle, history_df)
+                res = demo.on_new_candle(latest_candle, history_df)
+                history_df = handle_signal_approval(demo, res)
                 
-                # If no trade was taken (and no trade is active)
-                if not demo.active_trade and not auto_repeat:
+                # If no trade was taken (and no trades are active)
+                if not demo.active_trades and not auto_repeat:
                     choice = input("\nNo trade found. Repeat and wait for next candle? (y/n) or type 'auto' to enable auto-mode: ").strip().lower()
                     if choice == 'n':
                         print("Stopping MT5 Demo Engine.")
@@ -201,6 +244,11 @@ def main():
                         print("Auto-Repeat enabled. Waiting for next candle...")
                     else:
                         print("Waiting for next candle...")
+            else:
+                # HEARTBEAT: Re-check signals from the last known closed candle if no trade is active
+                # This ensures the bot looks for new trades immediately after one closes mid-candle.
+                res = demo.heartbeat(history_df)
+                history_df = handle_signal_approval(demo, res)
                 
     except KeyboardInterrupt:
         print("\nStopping MT5 Demo Engine.")
