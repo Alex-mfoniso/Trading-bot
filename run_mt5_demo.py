@@ -5,6 +5,7 @@ import msvcrt
 import pandas as pd
 from live_engine import LiveDemoEngine
 from session_engine import SessionEngine
+from telegram_manager import TelegramManager
 
 # --- Configuration ---
 SYMBOL = "XAUUSD"
@@ -14,6 +15,10 @@ RISK_PERCENT = 0.01
 # --- PUBLIC REPORTING ---
 # Paste your Google Apps Script Web App URL here to enable online Excel logs
 GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbxvq6KZHwPozEWr2OHtFj1-W0cLtME3g_KiCyA6u05Ya0KQK56wqrmj_oxR-SsnL-Odug/exec" 
+
+# --- TELEGRAM CONFIGURATION ---
+TELEGRAM_TOKEN = "8651350878:AAEPJ9gE-XuIEk-yfisZSsV3mzhk77yCOaY"
+TELEGRAM_CHAT_ID = "8562027665"
 
 def get_historical_data(symbol, timeframe, num_bars):
     """
@@ -68,10 +73,16 @@ def background_monitor(engine):
     print(f"[{time.strftime('%H:%M:%S')}] 🚀 High-Frequency Management Thread Started.")
     while True:
         try:
-            engine.monitor_active_trade()
+            # Create a copy to avoid modification during iteration
+            with engine.trade_lock:
+                trades = list(engine.active_trades.values())
+            
+            for t in trades:
+                engine.monitor_active_trade(t)
+                
             time.sleep(1) # React in less than 1 second
         except Exception as e:
-            # We don't want the monitor thread to ever crash the whole bot
+            # print(f"DEBUG: Background monitor error: {e}")
             time.sleep(5)
 
 def timed_input(prompt, timeout=60, default='n'):
@@ -91,7 +102,7 @@ def timed_input(prompt, timeout=60, default='n'):
             return default
         time.sleep(0.1)
 
-def handle_signal_approval(demo, res):
+def handle_signal_approval(demo, res, tg=None):
     """Processes the result of an engine step and handles manual approval."""
     if not isinstance(res, tuple):
         return res # Return history_df as is if old format (safety)
@@ -104,11 +115,24 @@ def handle_signal_approval(demo, res):
         print(f"Trigger: {signal.get('trigger_details', '')}")
         print(f"--------------------------------------------------")
         
-        ans = timed_input("EXECUTE THIS TRADE?", timeout=60, default='n')
+        # 1. Send to Telegram if available
+        if tg:
+            tg.send_signal_alert(signal, candle)
+            print(f"[{time.strftime('%H:%M:%S')}] 💬 Awaiting approval via Telegram...")
+            ans = tg.poll_for_response(timeout=60)
+        else:
+            # 2. Local Terminal Prompt
+            ans = timed_input("EXECUTE THIS TRADE?", timeout=60, default='n')
+            
         if ans == 'y':
             demo._execute_trade(signal, candle)
+            if tg: tg.send_message("✅ *Trade Executed Successfully!*")
         else:
             print(f"[{time.strftime('%H:%M:%S')}] Signal SKIPPED or timed out.")
+            if tg and ans == 'timeout': 
+                tg.send_message("⌛ *Signal Timed Out.* Trade skipped.")
+            elif tg:
+                tg.send_message("❌ *Signal Rejected.*")
             
     return history_df
 
@@ -192,6 +216,12 @@ def main():
     if demo.use_mt5:
         demo.recover_active_trade(history_df)
 
+    # 2.8 TELEGRAM: Setup Remote Control
+    tg = None
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        tg = TelegramManager(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+        tg.send_message("🚀 *Trading Bot Started!* Monitoring XAUUSD.")
+
     
     # Track the last known candle timestamp so we only process new candles once
     last_processed_time = history_df.iloc[-1]['timestamp']
@@ -231,7 +261,7 @@ def main():
                 
                 # Check for trade
                 res = demo.on_new_candle(latest_candle, history_df)
-                history_df = handle_signal_approval(demo, res)
+                history_df = handle_signal_approval(demo, res, tg=tg)
                 
                 # If no trade was taken (and no trades are active)
                 if not demo.active_trades and not auto_repeat:
@@ -245,10 +275,10 @@ def main():
                     else:
                         print("Waiting for next candle...")
             else:
-                # HEARTBEAT: Re-check signals from the last known closed candle if no trade is active
-                # This ensures the bot looks for new trades immediately after one closes mid-candle.
+                # HEARTBEAT
+                if tg: tg.process_commands(demo)
                 res = demo.heartbeat(history_df)
-                history_df = handle_signal_approval(demo, res)
+                history_df = handle_signal_approval(demo, res, tg=tg)
                 
     except KeyboardInterrupt:
         print("\nStopping MT5 Demo Engine.")

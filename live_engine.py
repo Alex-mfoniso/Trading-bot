@@ -194,7 +194,8 @@ class LiveDemoEngine:
             "tp": tp,
             "tp_1": tp_1,
             "lots": lots,
-            "initial_lots": lots, # Keep the original size for logging
+            "initial_lots": lots,
+            "accumulated_pnl": 0.0,
             "strategy": strategy_id,
             "strategy_name": signal.get("strategy_name", "Unknown"),
             "priority": signal.get("priority", 10),
@@ -338,6 +339,10 @@ class LiveDemoEngine:
         with self.trade_lock:
             if not t:
                 return
+            
+            # Diagnostic: Print status every 30 iterations (approx 30s) to avoid spam
+            t["monitor_count"] = t.get("monitor_count", 0) + 1
+            is_diag_tick = (t["monitor_count"] % 30 == 0)
     
             # 1. MT5 CHECK (If position closed externally)
             if self.use_mt5 and t.get("mt5_ticket"):
@@ -363,6 +368,10 @@ class LiveDemoEngine:
                 low_price = current_price 
             else:
                 return
+
+            if is_diag_tick:
+               profit_pts = (current_price - t['entry_price']) if t['type'] == 'long' else (t['entry_price'] - current_price)
+               print(f"[{time.strftime('%H:%M:%S')}] Monitoring Ticket {t.get('mt5_ticket', 'SIM')}: Profit {profit_pts:.2f} | BE: {t.get('be_moved')} | Part: {t.get('partial_tp_hit')}")
 
         # 1.5 SIMULATION SL/TP CHECK
         if not self.use_mt5:
@@ -487,14 +496,15 @@ class LiveDemoEngine:
                 else:
                     print(f"[{time.strftime('%H:%M:%S')}] MT5 Partial Close FAILED! Code: {res.retcode}")
         else:
-            # Simulation: Just add the pnl of the closed portion to balance
+            # Simulation: Just add the pnl of the closed portion to accumulated_pnl
             if t["type"] == "long":
                 pnl = (t["tp_1"] - t["entry_price"]) * close_lots * 100
             else:
                 pnl = (t["entry_price"] - t["tp_1"]) * close_lots * 100
             
-            self.balance += pnl
+            t["accumulated_pnl"] = t.get("accumulated_pnl", 0.0) + pnl
             t["lots"] -= close_lots
+            print(f"[{time.strftime('%H:%M:%S')}] [SIM] Partial Close SUCCESS. PnL: ${pnl:.2f}")
             print(f"[{time.strftime('%H:%M:%S')}] Simulation Partial Close: ${pnl:.2f} added. Remaining lots: {t['lots']:.2f}")
 
     def _modify_trade_sl(self, t, new_sl):
@@ -597,6 +607,9 @@ class LiveDemoEngine:
                 final_pnl = (close_price - t["entry_price"]) * t["lots"] * 100
             else:
                 final_pnl = (t["entry_price"] - close_price) * t["lots"] * 100
+            
+            # Add previously taken partial profits
+            final_pnl += t.get("accumulated_pnl", 0.0)
         
         # Determine Status
         status = "PROFIT ✅" if final_pnl > 0.01 else "LOSS ❌"
@@ -630,6 +643,23 @@ class LiveDemoEngine:
         t["status"] = status
         self.history.append(t)
         self._log_to_file(t)
+
+    def close_all_trades(self, reason="Manual Bulk Close"):
+        """Immediately closes all active positions."""
+        with self.trade_lock:
+            trades = list(self.active_trades.values())
+        
+        if not trades:
+            return 0
+            
+        count = 0
+        current_tick = mt5.symbol_info_tick(self.symbol) if self.use_mt5 else None
+        candle = {"close": current_tick.bid if current_tick and self.use_mt5 else 0}
+        
+        for t in trades:
+            self._close_active_trade(t, candle, reason=reason)
+            count += 1
+        return count
 
     def _fetch_htf_trend(self):
         """Fetches last 50 H1 bars from MT5 and calculates the trend state."""
@@ -792,6 +822,7 @@ class LiveDemoEngine:
                 "tp_1": tp_1,
                 "lots": target_pos.volume,
                 "initial_lots": target_pos.volume,
+                "accumulated_pnl": 0.0,
                 "strategy": "Recovered",
                 "strategy_name": "Recovered Trade",
                 "priority": 10,
