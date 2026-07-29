@@ -1,3 +1,4 @@
+import os
 import time
 import MetaTrader5 as mt5
 import threading
@@ -17,8 +18,9 @@ RISK_PERCENT = 0.01
 GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbxvq6KZHwPozEWr2OHtFj1-W0cLtME3g_KiCyA6u05Ya0KQK56wqrmj_oxR-SsnL-Odug/exec" 
 
 # --- TELEGRAM CONFIGURATION ---
-TELEGRAM_TOKEN = "8651350878:AAEPJ9gE-XuIEk-yfisZSsV3mzhk77yCOaY"
-TELEGRAM_CHAT_ID = "8562027665"
+# Store these in a local .env file (ignored by git) or your shell environment.
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 def get_historical_data(symbol, timeframe, num_bars):
     """
