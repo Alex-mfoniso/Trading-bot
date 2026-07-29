@@ -9,8 +9,8 @@ from performance import PerformanceAnalyzer
 
 # --- Configuration ---
 SYMBOL = "XAUUSD"
-TIMEFRAME = mt5.TIMEFRAME_H1 # USER is likely running H1
-NUM_BARS = 100 # ~4 days of H1 data
+TIMEFRAME = mt5.TIMEFRAME_M1
+NUM_BARS = 2000 # ~1.5 days of M1 data
 
 def get_historical_data(symbol, timeframe, num_bars):
     if not mt5.initialize():

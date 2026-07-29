@@ -6,16 +6,19 @@ class StrategyEngine:
             return None
             
         current_candle = current_slice.iloc[-1]
+        prev_candle = current_slice.iloc[-2]
         in_session = current_candle.get("is_killzone", True)
         
         if not in_session and not ignore_sessions:
             return None
 
         adx = current_candle.get("adx", 0)
+        prev_adx = prev_candle.get("adx", 0)
+        adx_rising = adx > prev_adx
         
-        # Define market regime
-        is_trending = adx > 25
-        is_ranging = adx < 20
+        # Define market regime - Adjusted thresholds for more trades
+        is_trending = adx > 20 or (adx > 18 and adx_rising)
+        is_ranging = adx < 15
         
         # Order strategies based on current market regime
         if is_trending:
@@ -35,11 +38,9 @@ class StrategyEngine:
                 (self._strategy_5_volume_anomaly, 5)
             ]
         else:
-            # Transitioning/Neutral: MACD -> EMA Trend -> Breakout -> Vol Anomaly
+            # Transitioning/Neutral: MACD -> EMA Trend -> Vol Anomaly
             strategy_order = [
                 (self._strategy_4_macd_cross, 4),
-                (self._strategy_1_ema_trend, 1),
-                (self._strategy_2_breakout, 2),
                 (self._strategy_5_volume_anomaly, 5),
                 (self._strategy_6_scalping, 6)
             ]
@@ -70,8 +71,8 @@ class StrategyEngine:
         # if adx < 25:
         #     return None
 
-        trend_up = candle["ema_50"] > candle["ema_200"] and trend_state >= 0
-        trend_down = candle["ema_50"] < candle["ema_200"] and trend_state <= 0
+        trend_up = candle["ema_50"] > candle["ema_200"] and trend_state == 1
+        trend_down = candle["ema_50"] < candle["ema_200"] and trend_state == -1
         
         if trend_up:
             if candle["low"] <= candle["ema_50"] and candle["close"] > candle["ema_50"]:
@@ -112,8 +113,8 @@ class StrategyEngine:
         prev_candle = slice.iloc[-2]
         vol_check = candle["volume"] > candle["volume_avg"]
         
-        if candle["close"] > prev_candle["highest_20"] and trend_state >= 0:
-            if vol_check:
+        if candle["close"] > prev_candle["highest_20"] and trend_state == 1:
+            if vol_check and adx > 20:
                 entry = candle["close"]
                 sl = candle["low"] - candle["atr_14"] * 2.0
                 bp = entry - sl
@@ -121,13 +122,13 @@ class StrategyEngine:
                 return {
                     "type": "long", "entry": entry, "sl": sl, "tp": tp, "strategy_id": 2, "priority": 2,
                     "strategy_name": "Volatility Breakout",
-                    "description": "Enters when price breaks above a 20-period high with strong volume and trend alignment.",
-                    "trigger_details": f"High Breakout | Volume > Avg | ADX: {adx:.1f} | Structure: {trend_state}",
+                    "description": "Enters when price breaks above a 20-period high with strong volume and confirmed bullish structure.",
+                    "trigger_details": f"High Breakout | Volume > Avg | ADX: {adx:.1f} | Structure: Bullish",
                     "expectation": "Expect a fast, explosive continuation as momentum buyers enter."
                 }
             
-        elif candle["close"] < prev_candle["lowest_20"] and trend_state <= 0:
-            if vol_check:
+        elif candle["close"] < prev_candle["lowest_20"] and trend_state == -1:
+            if vol_check and adx > 20:
                 entry = candle["close"]
                 sl = candle["high"] + candle["atr_14"] * 2.0
                 bp = sl - entry
@@ -135,15 +136,15 @@ class StrategyEngine:
                 return {
                     "type": "short", "entry": entry, "sl": sl, "tp": tp, "strategy_id": 2, "priority": 2,
                     "strategy_name": "Volatility Breakout",
-                    "description": "Enters when price breaks below a 20-period low with strong volume and trend alignment.",
-                    "trigger_details": f"Low Breakout | Volume > Avg | ADX: {adx:.1f} | Structure: {trend_state}",
+                    "description": "Enters when price breaks below a 20-period low with strong volume and confirmed bearish structure.",
+                    "trigger_details": f"Low Breakout | Volume > Avg | ADX: {adx:.1f} | Structure: Bearish",
                     "expectation": "Expect a fast drop as support breaks."
                 }
         return None
 
     def _strategy_3_mean_reversion(self, candle, slice):
         adx = candle.get("adx", 50)
-        if adx > 20:
+        if adx > 18:
             return None
             
         rsi = candle["rsi_14"]
@@ -251,30 +252,40 @@ class StrategyEngine:
         bearish_cross = ema_9 < ema_21
         
         adx = candle.get("adx", 0)
+        trend_state = candle.get("trend_state", 0)
         
-        if trend_up and bullish_cross:
-            # Entry condition: Price pulls back to EMA 9 but stays above EMA 21
-            if candle["low"] < ema_9 and candle["close"] > ema_9 and adx > 20:
+        # Candle patterns from IndicatorEngine
+        is_hammer = candle.get("is_hammer", False)
+        is_shooting_star = candle.get("is_shooting_star", False)
+        is_bull_engulf = candle.get("is_bullish_engulfing", False)
+        is_bear_engulf = candle.get("is_bearish_engulfing", False)
+        
+        if trend_up and bullish_cross and trend_state == 1:
+            # Entry condition: Price pulls back to EMA 9 AND Rejection Pattern
+            rejection = is_hammer or is_bull_engulf
+            if candle["low"] < ema_9 and rejection and adx > 15:
                 entry = candle["close"]
                 sl = candle["low"] - candle["atr_14"] * 1.5 # Tighter SL for scalping
                 tp = entry + (entry - sl) * 1.5 # 1.5 R:R
                 return {
                     "type": "long", "entry": entry, "sl": sl, "tp": tp, "strategy_id": 6, "priority": 6,
                     "strategy_name": "HFT Scalper (M1/M5)",
-                    "description": "A high-speed chaser that enters on small pullbacks to the fast EMA 9 within a strong uptrend.",
-                    "trigger_details": f"EMA 9/21/50/200 Bullish | ADX: {adx:.1f} | Pullback to 9",
+                    "description": "A high-speed chaser that enters on price rejection at the EMA 9 within a strong uptrend structure.",
+                    "trigger_details": f"EMA 9/21/50/200 Bullish | ADX: {adx:.1f} | Structure: Bullish | Rejection: {'Hammer' if is_hammer else 'Engulfing'}",
                     "expectation": "Expect a quick surge for a small profit in line with the main trend."
                 }
-        elif trend_down and bearish_cross:
-            if candle["high"] > ema_9 and candle["close"] < ema_9 and adx > 20:
+        elif trend_down and bearish_cross and trend_state == -1:
+            # Entry condition: Price rallies to EMA 9 AND Rejection Pattern
+            rejection = is_shooting_star or is_bear_engulf
+            if candle["high"] > ema_9 and rejection and adx > 15:
                 entry = candle["close"]
                 sl = candle["high"] + candle["atr_14"] * 1.5
                 tp = entry - (sl - entry) * 1.5
                 return {
                     "type": "short", "entry": entry, "sl": sl, "tp": tp, "strategy_id": 6, "priority": 6,
                     "strategy_name": "HFT Scalper (M1/M5)",
-                    "description": "A high-speed chaser that enters on small rallies back to the EMA 9 within a strong downtrend.",
-                    "trigger_details": f"EMA 9/21/50/200 Bearish | ADX: {adx:.1f} | Pullback to 9",
+                    "description": "A high-speed chaser that enters on price rejection at the EMA 9 within a strong downtrend structure.",
+                    "trigger_details": f"EMA 9/21/50/200 Bearish | ADX: {adx:.1f} | Structure: Bearish | Rejection: {'ShootingStar' if is_shooting_star else 'Engulfing'}",
                     "expectation": "Expect price to drop quickly in line with the main trend."
                 }
         return None

@@ -33,9 +33,13 @@ class LiveDemoEngine:
         self.ignore_sessions = ignore_sessions
         self.max_trades = max_trades
         self.google_sheet_url = None # Set this in run_mt5_demo.py
+        self.tg_manager = None # Set this in run_mt5_demo.py
         self.htf_trend = 0 # 1: Bullish, -1: Bearish, 0: Unknown/Neutral
         self.log_file = "trade_history.csv"
         self._initialize_log()
+        
+        # Track pending modifications for manual approval (Ticket -> {type, request_time, details})
+        self.pending_modifications = {}
         
         mode = "MT5 REAL-TIME" if use_mt5 else "LOCAL SIMULATION"
         print(f"[{time.strftime('%H:%M:%S')}] LIVE DEMO INITIALIZED | Mode: {mode} | Balance: {self.balance} | Risk: {risk_per_trade*100}%")
@@ -114,6 +118,43 @@ class LiveDemoEngine:
                 if already_running:
                     # print(f"DEBUG: Already in {signal['strategy_id']}. Skipping duplicate.")
                     return None, None
+                    
+            # --- BEGIN PRE-FLIGHT CHECKS ---
+            warnings = []
+            
+            # 1. Liquidity Check
+            vol_avg = current_candle.get("volume_avg", 0)
+            curr_vol = current_candle.get("volume", 0)
+            if vol_avg > 0 and curr_vol < (vol_avg * 0.5):
+                warnings.append(f"Low liquidity (Vol {curr_vol} < 50% of Avg)")
+                
+            # 2. Risk Calculation
+            entry = signal["entry"]
+            sl = signal["sl"]
+            stop_distance = abs(entry - sl)
+            risk_amount = self.risk_engine.calculate_risk_amount(self.balance)
+            adx = current_candle.get("adx", 0)
+            risk_multiplier = 1.0
+            if adx > 40:
+                risk_multiplier = 1.5 
+            elif adx < 20:
+                risk_multiplier = 0.5 
+            adjusted_risk_amount = risk_amount * risk_multiplier
+            
+            lots = 0.0
+            actual_risk_pct = 0.0
+            if stop_distance > 0:
+                lots, actual_risk_pct, should_skip, reason = self.risk_engine.calculate_lots(self.balance, adjusted_risk_amount, stop_distance)
+                if should_skip:
+                    warnings.append(reason) # Add constraint explicitly as warning instead of aborting
+            else:
+                warnings.append("Invalid Stop Distance (0)")
+                
+            signal["calculated_lots"] = lots
+            signal["actual_risk_pct"] = actual_risk_pct
+            signal["warnings"] = warnings
+            signal["htf_trend"] = "BULLISH 🟢" if self.htf_trend == 1 else ("BEARISH 🔴" if self.htf_trend == -1 else "NEUTRAL ⚪")
+            # --- END PRE-FLIGHT CHECKS ---
             
             return signal, current_candle
             
@@ -133,37 +174,11 @@ class LiveDemoEngine:
         tp = signal["tp"]
         strategy_id = signal.get("strategy_id", "Unknown")
         
-        risk_amount = self.risk_engine.calculate_risk_amount(self.balance)
-        stop_distance = abs(entry - sl)
+        lots = signal.get("calculated_lots", 0.01)
+        actual_risk_pct = signal.get("actual_risk_pct", 0.0)
         
-        if stop_distance == 0:
-            return
-            
-        # 3. Liquidity Check (Tick Volume should be > 50% of Average)
-        vol_avg = current_candle.get("volume_avg", 0)
-        curr_vol = current_candle.get("volume", 0)
-        if vol_avg > 0 and curr_vol < (vol_avg * 0.5):
-             print(f"[{time.strftime('%H:%M:%S')}] 🛑 [ABORTED] Low liquidity! Vol: {curr_vol} < 50% of Avg ({vol_avg:.0f})")
-             return
-             
-        # 4. DYNAMIC RISK SCALING
-        adx = current_candle.get("adx", 0)
-        risk_multiplier = 1.0 # Standard
-        
-        if adx > 40:
-            risk_multiplier = 1.5 # High Confidence Trend
-            print(f"[{time.strftime('%H:%M:%S')}] 🔥 DYNAMIC RISK: High ADX ({adx:.1f}). Increasing risk to 1.5x.")
-        elif adx < 25:
-            risk_multiplier = 0.5 # Low Confidence / Chop
-            print(f"[{time.strftime('%H:%M:%S')}] 💤 DYNAMIC RISK: Low ADX ({adx:.1f}). Reducing risk to 0.5x.")
-        
-        adjusted_risk_amount = risk_amount * risk_multiplier
-        
-        # Smarter Lot Calculation
-        lots, actual_risk_pct, should_skip, reason = self.risk_engine.calculate_lots(self.balance, adjusted_risk_amount, stop_distance)
-        
-        if should_skip:
-            print(f"[{time.strftime('%H:%M:%S')}] 🛑 [ABORTED] {reason}")
+        if lots <= 0:
+            print(f"[{time.strftime('%H:%M:%S')}] 🛑 [ABORTED] Lot size is 0 or invalid.")
             return
             
         final_risk_amount = (actual_risk_pct / 100) * self.balance
@@ -403,63 +418,127 @@ class LiveDemoEngine:
             
             # Partial TP: Close 50% at 1:1 R:R
             if not t.get("partial_tp_hit", False) and high_price >= t["tp_1"]:
-                print(f"[{time.strftime('%H:%M:%S')}] 🎯 [REAL-TIME] PARTIAL TP HIT (Long)! Price: {current_price:.2f} >= TP1: {t['tp_1']:.2f}")
-                self._partial_close_trade(t, 0.5, reason="Partial TP")
-                t["partial_tp_hit"] = True
-                
-                # Move to Break-Even immediately
-                if not t.get("be_moved", False):
+                if self._check_approval(t, "Partial TP (Long)", current_price):
+                    print(f"[{time.strftime('%H:%M:%S')}] 🎯 [REAL-TIME] PARTIAL TP HIT (Long)! Price: {current_price:.2f} >= TP1: {t['tp_1']:.2f}")
+                    self._partial_close_trade(t, 0.5, reason="Partial TP")
+                    t["partial_tp_hit"] = True
+                    
+                    # Move to Break-Even immediately (Automatic after partial)
+                    if not t.get("be_moved", False):
+                        new_sl = t["entry_price"] + (atr * 0.1)
+                        self._modify_trade_sl(t, new_sl)
+                        t["be_moved"] = True
+                        t["sl"] = new_sl
+
+            # Break-Even: Move to entry if price > 1 ATR from entry (if not already moved)
+            if not t.get("be_moved", False) and profit_points > (atr * 1.0):
+                if self._check_approval(t, "Break-Even (Long)", current_price):
+                    print(f"[{time.strftime('%H:%M:%S')}] [REAL-TIME] MOVE TO BREAK-EVEN! Profit > 1 ATR.")
                     new_sl = t["entry_price"] + (atr * 0.1)
                     self._modify_trade_sl(t, new_sl)
                     t["be_moved"] = True
                     t["sl"] = new_sl
 
-            # Break-Even: Move to entry if price > 1 ATR from entry (if not already moved)
-            if not t.get("be_moved", False) and profit_points > (atr * 1.0):
-                print(f"[{time.strftime('%H:%M:%S')}] [REAL-TIME] MOVE TO BREAK-EVEN! Profit > 1 ATR.")
-                new_sl = t["entry_price"] + (atr * 0.1)
-                self._modify_trade_sl(t, new_sl)
-                t["be_moved"] = True
-                t["sl"] = new_sl
-
             # Trailing Stop: Move SL if price > 1.5 ATR from entry
             if profit_points > (atr * 1.5):
                 suggested_sl = current_price - (atr * 1.5)
                 if suggested_sl > t["sl"]:
-                    print(f"[{time.strftime('%H:%M:%S')}] [REAL-TIME] TRAILING SL! New Long SL: {suggested_sl:.2f}")
-                    self._modify_trade_sl(t, suggested_sl)
-                    t["sl"] = suggested_sl
+                    if self._check_approval(t, "Trailing Stop (Long)", current_price):
+                        print(f"[{time.strftime('%H:%M:%S')}] [REAL-TIME] TRAILING SL! New Long SL: {suggested_sl:.2f}")
+                        self._modify_trade_sl(t, suggested_sl)
+                        t["sl"] = suggested_sl
 
         elif t["type"] == "short":
             profit_points = t["entry_price"] - current_price
             
             # Partial TP
             if not t.get("partial_tp_hit", False) and low_price <= t["tp_1"]:
-                print(f"[{time.strftime('%H:%M:%S')}] 🎯 [REAL-TIME] PARTIAL TP HIT (Short)! Price: {current_price:.2f} <= TP1: {t['tp_1']:.2f}")
-                self._partial_close_trade(t, 0.5, reason="Partial TP")
-                t["partial_tp_hit"] = True
-                
-                if not t.get("be_moved", False):
+                if self._check_approval(t, "Partial TP (Short)", current_price):
+                    print(f"[{time.strftime('%H:%M:%S')}] 🎯 [REAL-TIME] PARTIAL TP HIT (Short)! Price: {current_price:.2f} <= TP1: {t['tp_1']:.2f}")
+                    self._partial_close_trade(t, 0.5, reason="Partial TP")
+                    t["partial_tp_hit"] = True
+                    
+                    if not t.get("be_moved", False):
+                        new_sl = t["entry_price"] - (atr * 0.1)
+                        self._modify_trade_sl(t, new_sl)
+                        t["be_moved"] = True
+                        t["sl"] = new_sl
+
+            # Break-Even
+            if not t.get("be_moved", False) and profit_points > (atr * 1.0):
+                if self._check_approval(t, "Break-Even (Short)", current_price):
+                    print(f"[{time.strftime('%H:%M:%S')}] [REAL-TIME] MOVE TO BREAK-EVEN! Profit > 1 ATR.")
                     new_sl = t["entry_price"] - (atr * 0.1)
                     self._modify_trade_sl(t, new_sl)
                     t["be_moved"] = True
                     t["sl"] = new_sl
 
-            # Break-Even
-            if not t.get("be_moved", False) and profit_points > (atr * 1.0):
-                print(f"[{time.strftime('%H:%M:%S')}] [REAL-TIME] MOVE TO BREAK-EVEN! Profit > 1 ATR.")
-                new_sl = t["entry_price"] - (atr * 0.1)
-                self._modify_trade_sl(t, new_sl)
-                t["be_moved"] = True
-                t["sl"] = new_sl
-
             # Trailing Stop
             if profit_points > (atr * 1.5):
                 suggested_sl = current_price + (atr * 1.5)
                 if suggested_sl < t["sl"]:
-                    print(f"[{time.strftime('%H:%M:%S')}] [REAL-TIME] TRAILING SL! New Short SL: {suggested_sl:.2f}")
-                    self._modify_trade_sl(t, suggested_sl)
-                    t["sl"] = suggested_sl
+                    if self._check_approval(t, "Trailing Stop (Short)", current_price):
+                        print(f"[{time.strftime('%H:%M:%S')}] [REAL-TIME] TRAILING SL! New Short SL: {suggested_sl:.2f}")
+                        self._modify_trade_sl(t, suggested_sl)
+                        t["sl"] = suggested_sl
+
+    def _check_approval(self, t, decision_type, current_price):
+        """
+        Handles the manual approval logic with a 60s timeout.
+        Returns True if approved or timed out, False if pending or rejected.
+        """
+        ticket = t.get("mt5_ticket") or t.get("sim_id")
+        decision_key = f"{ticket}_{decision_type}"
+        
+        # 1. No Comms Manager? Approval by default (safety)
+        if not self.tg_manager:
+            return True
+            
+        # 2. Check if already recorded as approved/rejected in trade object
+        if "approvals" in t and decision_type in t["approvals"]:
+            approved = t["approvals"][decision_type]
+            if approved is not None:
+                return approved # True or False
+            
+        # 3. Check if currently pending in global dict
+        if decision_key in self.pending_modifications:
+            pending = self.pending_modifications[decision_key]
+            
+            # Check for timeout (60 seconds)
+            elapsed = time.time() - pending["request_time"]
+            if elapsed > 60:
+                print(f"[{time.strftime('%H:%M:%S')}] ⌛ Approval Timeout for {decision_type} on {ticket}. Proceeding automatically.")
+                if self.tg_manager:
+                    self.tg_manager.send_message(f"⌛ *Approval Timeout* for {decision_type} on Ticket `{ticket}`. Proceeding automatically.")
+                del self.pending_modifications[decision_key]
+                return True
+            
+            return False # Still waiting
+            
+        # 4. First time seeing this decision - Request Approval
+        print(f"[{time.strftime('%H:%M:%S')}] 🔔 Requesting approval for {decision_type} (Ticket {ticket})...")
+        self.pending_modifications[decision_key] = {
+            "type": decision_type,
+            "request_time": time.time(),
+            "ticket": ticket
+        }
+        
+        if "approvals" not in t:
+            t["approvals"] = {}
+        t["approvals"][decision_type] = None # Mark as pending in trade object too
+        
+        if self.tg_manager:
+            msg = (
+                f"⚡ *TRADE DECISION PENDING*\n\n"
+                f"ID: `{ticket}`\n"
+                f"Action: *{decision_type}*\n"
+                f"Price: {current_price:.2f}\n\n"
+                f"Reply 'y' to approve, 'n' to reject.\n"
+                f"_Auto-confirming in 60 seconds..._"
+            )
+            self.tg_manager.send_message(msg)
+            
+        return False
 
     def _partial_close_trade(self, t, close_percent, reason=""):
         if not t: return
@@ -567,10 +646,10 @@ class LiveDemoEngine:
 
         return 0.0
 
-    def _close_active_trade(self, t, candle, reason=""):
+    def _close_active_trade(self, t, candle=None, reason=""):
         if not t: return
 
-        close_price = candle["close"]
+        close_price = candle["close"] if candle else 0
         final_pnl = 0.0
         
         if self.use_mt5 and t.get("mt5_ticket"):

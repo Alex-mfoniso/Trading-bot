@@ -122,7 +122,11 @@ def handle_signal_approval(demo, res, tg=None):
             ans = tg.poll_for_response(timeout=60)
         else:
             # 2. Local Terminal Prompt
-            ans = timed_input("EXECUTE THIS TRADE?", timeout=60, default='n')
+            warnings = signal.get("warnings", [])
+            if warnings:
+                ans = timed_input(f"⚠️ WARNING: {', '.join(warnings)}\nEXECUTE THIS TRADE ANYWAY?", timeout=60, default='n')
+            else:
+                ans = timed_input("EXECUTE THIS TRADE?", timeout=60, default='n')
             
         if ans == 'y':
             demo._execute_trade(signal, candle)
@@ -220,6 +224,7 @@ def main():
     tg = None
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         tg = TelegramManager(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+        demo.tg_manager = tg # Link to engine for manual approvals
         tg.send_message("🚀 *Trading Bot Started!* Monitoring XAUUSD.")
 
     
