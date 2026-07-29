@@ -68,7 +68,42 @@ class IndicatorEngine:
         df['highest_20'] = df['high'].rolling(window=20).max()
         df['lowest_20'] = df['low'].rolling(window=20).min()
         
+        # --- Candle Pattern Detection ---
+        df = IndicatorEngine._add_candle_patterns(df)
+        
         # Drop initial NaN rows required for warmup
         df.dropna(inplace=True)
         return df.reset_index(drop=True)
+
+    @staticmethod
+    def _add_candle_patterns(df: pd.DataFrame) -> pd.DataFrame:
+        """Adds columns for common reversal and momentum candle patterns."""
+        # Body and wick calculations
+        body = abs(df["close"] - df["open"])
+        upper_wick = df["high"] - df[["open", "close"]].max(axis=1)
+        lower_wick = df[["open", "close"]].min(axis=1) - df["low"]
+        candle_range = df["high"] - df["low"]
+        
+        # 1. Hammer / Shooting Star (Wick Rejection)
+        # Hammer: Small body, long lower wick, little/no upper wick
+        df["is_hammer"] = (lower_wick >= (body * 2)) & (upper_wick <= (body * 0.5)) & (candle_range > 0)
+        # Shooting Star: Small body, long upper wick, little/no lower wick
+        df["is_shooting_star"] = (upper_wick >= (body * 2)) & (lower_wick <= (body * 0.5)) & (candle_range > 0)
+        
+        # 2. Engulfing Patterns
+        prev_open = df["open"].shift(1)
+        prev_close = df["close"].shift(1)
+        prev_body = abs(prev_close - prev_open)
+        
+        # Bullish Engulfing: Candle body covers previous candle body and is green
+        df["is_bullish_engulfing"] = (df["close"] > df["open"]) & (prev_close < prev_open) & \
+                                     (df["close"] >= prev_open) & (df["open"] <= prev_close) & \
+                                     (body > prev_body)
+                                     
+        # Bearish Engulfing: Candle body covers previous candle body and is red
+        df["is_bearish_engulfing"] = (df["close"] < df["open"]) & (prev_close > prev_open) & \
+                                      (df["close"] <= prev_open) & (df["open"] >= prev_close) & \
+                                      (body > prev_body)
+                                      
+        return df
 

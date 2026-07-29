@@ -75,6 +75,10 @@ class BacktestEngine:
                 # 5. Simulate Trade
                 result = self.simulate_trade(i+1, signal)
                 if result:
+                    result["open_time"] = current_row["timestamp"]
+                    result["strategy"] = signal.get("strategy_id", "Unknown")
+                    result["strategy_name"] = signal.get("strategy_name", "Unknown")
+                    
                     self.trades.append(result)
                     self.balance += result["profit"]
                     self.risk_engine.update_daily_pnl(result["profit"])
